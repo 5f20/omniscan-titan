@@ -19,6 +19,12 @@ Built from the ground up on Python's `asyncio` event loop, Titan utilizes multip
 * **Context-Aware Protocol Analysis:** Distinguishes between HTTP, HTTPS, and raw TCP. Automatically extracts SSL certificate common names, HTTP server headers, and detects active Web Application Firewalls (WAFs) like Cloudflare, Imperva, and AWS.
 * **Real-Time Telemetry:** A Rich-powered terminal interface providing live, color-coded intelligence routing and statistical analysis as the scan progresses.
 
+### 🛡️ Recent Security & Performance Patches 24/06/2026
+* **DOM Bomb Protection:** Migrated to iterative XML parsing (`ET.iterparse`) to prevent memory exhaustion on gigabyte-sized Nmap outputs.
+* **CSV Armor:** Engineered strict sanitization to neutralize Excel macro/formula injections from malicious server banners.
+* **Zombie Process Eradication:** Implemented asynchronous cancellation traps to gracefully kill child Nmap binaries on user interrupts.
+* **Smart TLS Fallback:** Upgraded the HTTP analyzer to attempt strict verification first, falling back to unverified contexts while securely flagging MitM risks.
+
 ## 🏗️ Architecture Overview
 
 Unlike legacy synchronous scanners that wait for timeouts, Titan operates on a non-blocking asynchronous matrix. 
