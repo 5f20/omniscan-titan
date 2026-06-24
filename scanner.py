@@ -189,18 +189,29 @@ class OmniScanTitan:
         
         try:
             if use_ssl:
-                ctx = ssl.create_default_context()
-                ctx.check_hostname = False
-                ctx.verify_mode = ssl.CERT_NONE
-                ctx.options |= ssl.OP_LEGACY_SERVER_CONNECT
-                reader, writer = await asyncio.wait_for(
-                    asyncio.open_connection(host, port, ssl=ctx),
-                    timeout=self.timeout + 2,
-                )
-                cert = writer.get_extra_info("peercert")
-                if cert:
-                    subj = dict(x[0] for x in cert.get("subject", []))
-                    info_tags.append(f"SSL: {subj.get('commonName', 'Unknown')}")
+                ctx_secure = ssl.create_default_context()
+                ctx_insecure = ssl.create_default_context()
+                ctx_insecure.check_hostname = False
+                ctx_insecure.verify_mode = ssl.CERT_NONE
+                ctx_insecure.options |= ssl.OP_LEGACY_SERVER_CONNECT
+
+                try:
+                    # Attempt secure TLS connection first
+                    reader, writer = await asyncio.wait_for(
+                        asyncio.open_connection(host, port, ssl=ctx_secure),
+                        timeout=self.timeout + 2,
+                    )
+                    cert = writer.get_extra_info("peercert")
+                    if cert:
+                        subj = dict(x[0] for x in cert.get("subject", []))
+                        info_tags.append(f"🔒 Valid SSL: {subj.get('commonName', 'Unknown')}")
+                except ssl.SSLError:
+                    # Fallback to unverified TLS for self-signed assets (tags MitM risk)
+                    reader, writer = await asyncio.wait_for(
+                        asyncio.open_connection(host, port, ssl=ctx_insecure),
+                        timeout=self.timeout + 2,
+                    )
+                    info_tags.append("⚠️ SSL: UNTRUSTED/MitM RISK")
             else:
                 reader, writer = await asyncio.wait_for(
                     asyncio.open_connection(host, port),
@@ -428,6 +439,7 @@ class OmniScanTitan:
             async def _run_nmap_task(desc: str, cmd: List[str], xml_out: str) -> None:
                 if self.shutdown_event.is_set():
                     return
+                process = None
                 try:
                     process = await asyncio.create_subprocess_exec(
                         *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
@@ -437,10 +449,10 @@ class OmniScanTitan:
                     
                     if updates:
                         async with self.lock:
-                            for addr, ports in updates.items():
+                            for addr, p_dict in updates.items():
                                 if addr not in self.results: 
                                     self.results[addr] = {}
-                                for port_id, nd in ports.items():
+                                for port_id, nd in p_dict.items():
                                     existing = self.results[addr].get(port_id, {})
                                     existing_banner = existing.get("info", "")
                                     nmap_banner = nd["nmap_banner"]
@@ -453,6 +465,15 @@ class OmniScanTitan:
                                     vulns = list(set(self._check_heuristics(final_banner) + existing.get("vulns", [])))
                                     self.results[addr][port_id] = {"state": "open", "service": nd["service"], "info": final_banner, "vulns": vulns}
                                     self.stats["hosts_up"].add(addr)
+                                    
+                except asyncio.CancelledError:
+                    if process and process.returncode is None:
+                        try:
+                            process.terminate()
+                            await process.wait()
+                        except Exception:
+                            pass
+                    raise
                 except Exception as exc:
                     console.print(f"[bold red][!] Nmap Error on {desc}: {exc}[/bold red]")
 
@@ -463,7 +484,7 @@ class OmniScanTitan:
                     return_exceptions=True,
                 )
                 for i, res in enumerate(results):
-                    if isinstance(res, Exception):
+                    if isinstance(res, Exception) and not isinstance(res, asyncio.CancelledError):
                         console.print(f"[bold red][!] Nmap task '{nmap_tasks[i][0]}' failed: {res}[/bold red]")
 
         finally:
@@ -475,39 +496,45 @@ class OmniScanTitan:
                 except OSError:
                     pass
 
-    def _parse_nmap_xml(self, xml_path: str) -> None:
+    def _parse_nmap_xml(self, xml_path: str) -> Dict[str, Dict[int, Dict[str, Any]]]:
+        updates: Dict[str, Dict[int, Dict[str, Any]]] = {}
         try:
             if not os.path.exists(xml_path) or os.path.getsize(xml_path) == 0:
-                return
-            tree = ET.parse(xml_path)
-            updates: Dict[str, Dict[int, Dict[str, Any]]] = {}
-
-            for host_elem in tree.getroot().findall("host"):
-                addr_elem = host_elem.find("address")
-                if addr_elem is None or not addr_elem.get("addr"): continue
-                addr = addr_elem.get("addr")
-                host_data: Dict[int, Dict[str, Any]] = {}
-
-                for port_elem in host_elem.findall(".//port"):
-                    try: port_id = int(port_elem.get("portid", 0))
-                    except ValueError: continue
-
-                    state_elem = port_elem.find("state")
-                    if state_elem is None or state_elem.get("state") not in ("open", "open|filtered"):
+                return updates
+                
+            context = ET.iterparse(xml_path, events=("end",))
+            for event, elem in context:
+                if elem.tag == "host":
+                    addr_elem = elem.find("address")
+                    if addr_elem is None or not addr_elem.get("addr"):
+                        elem.clear()
                         continue
+                    
+                    addr = addr_elem.get("addr")
+                    host_data: Dict[int, Dict[str, Any]] = {}
 
-                    srv = port_elem.find("service")
-                    name = srv.get("name", "unknown") if srv is not None else "unknown"
-                    product = srv.get("product", "") if srv is not None else ""
-                    version = srv.get("version", "") if srv is not None else ""
-                    nmap_banner = f"{product} {version}".strip()
+                    for port_elem in elem.findall(".//port"):
+                        try: 
+                            port_id = int(port_elem.get("portid", 0))
+                        except ValueError: 
+                            continue
 
-                    host_data[port_id] = {"state": "open", "service": name.upper(), "nmap_banner": nmap_banner}
+                        state_elem = port_elem.find("state")
+                        if state_elem is None or state_elem.get("state") not in ("open", "open|filtered"):
+                            continue
 
-                if host_data:
-                    updates[addr] = host_data
+                        srv = port_elem.find("service")
+                        name = srv.get("name", "unknown") if srv is not None else "unknown"
+                        product = srv.get("product", "") if srv is not None else ""
+                        version = srv.get("version", "") if srv is not None else ""
+                        nmap_banner = f"{product} {version}".strip()
 
-            
+                        host_data[port_id] = {"state": "open", "service": name.upper(), "nmap_banner": nmap_banner}
+
+                    if host_data:
+                        updates[addr] = host_data
+                        
+                    elem.clear()
 
         except Exception as exc:
             console.print(f"[dim red]Error processing Nmap output: {exc}[/dim red]")
