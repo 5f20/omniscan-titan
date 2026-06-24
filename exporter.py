@@ -8,6 +8,15 @@ from rich.console import Console
 
 console = Console()
 
+def _sanitize_csv(value: Any) -> str:
+    """Neutralize CSV Macro/Formula Injection payloads."""
+    if value is None:
+        return ""
+    val_str = str(value)
+    if val_str.startswith(("=", "+", "-", "@", "\t", "\r")):
+        return f"'{val_str}"
+    return val_str
+
 def export_results(results: Dict[str, Dict[int, Dict[str, Any]]], args: Any) -> None:
     clean = {h: p for h, p in results.items() if p}
     if not clean:
@@ -25,8 +34,12 @@ def export_results(results: Dict[str, Dict[int, Dict[str, Any]]], args: Any) -> 
             for h, ports in clean.items():
                 for pt, d in ports.items():
                     w.writerow([
-                        h, pt, d["state"], d["service"], d["info"],
-                        ", ".join(d.get("vulns", [])),
+                        _sanitize_csv(h),
+                        pt,
+                        _sanitize_csv(d["state"]),
+                        _sanitize_csv(d["service"]),
+                        _sanitize_csv(d["info"]),
+                        _sanitize_csv(", ".join(d.get("vulns", []))),
                     ])
         console.print(f"[+] Exported CSV   → [bold green]{args.out_csv}[/bold green]")
 
@@ -36,7 +49,7 @@ def export_results(results: Dict[str, Dict[int, Dict[str, Any]]], args: Any) -> 
         c.execute(
             """CREATE TABLE IF NOT EXISTS scans
                (timestamp TEXT, host TEXT, port INTEGER, state TEXT,
-                service TEXT, info TEXT, vulns TEXT)"""
+               service TEXT, info TEXT, vulns TEXT)"""
         )
         now = datetime.now().isoformat()
         for h, ports in clean.items():
