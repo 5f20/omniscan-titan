@@ -2,11 +2,9 @@ import sys
 import asyncio
 import argparse
 from datetime import datetime
-
 from rich.console import Console
 from rich.panel import Panel
 
-# Import our custom components
 from scanner import OmniScanTitan
 from utils import setup_signal_handlers
 from exporter import export_results
@@ -15,7 +13,7 @@ console = Console()
 
 async def main_async() -> None:
     parser = argparse.ArgumentParser(
-        description="OmniScan Titan ⚡ v1.0 (by 5f20) — Enterprise Network & App-Layer Recon",
+        description="OmniScan Titan ⚡ v2.0 (by 5f20) — Advanced Enterprise Recon Framework",
         formatter_class=argparse.RawTextHelpFormatter,
     )
 
@@ -26,10 +24,16 @@ async def main_async() -> None:
     parser.add_argument("-p", "--ports", required=True, help="Ports: '80,443', '1-1000', 'top', or 'all'")
     parser.add_argument("-m", "--mode", choices=["async", "nmap", "hybrid"], default="hybrid")
     parser.add_argument("--nmap-args", default="-sV -sC -Pn -T4 --version-light", help="Allowlisted nmap flags only")
-    parser.add_argument("-w", "--workers", type=int, default=1000)
-    parser.add_argument("--timeout", type=float, default=1.5)
+    parser.add_argument("-w", "--workers", type=int, default=2500, help="Initial FD Concurrency Limit")
+    parser.add_argument("--timeout", type=float, default=1.5, help="Socket timeout")
     
-    # Export arguments
+    # Advanced / OPSEC Features
+    parser.add_argument("--udp", action="store_true", help="Enable UDP scanning with deep payloads")
+    parser.add_argument("--doh", action="store_true", help="Use DNS over HTTPS (Cloudflare/Google) to prevent ISP snooping")
+    parser.add_argument("--opsec", action="store_true", help="Enable Stealth Mode (Jitter, UA rotation, AIMD limits)")
+    parser.add_argument("--proxy", type=str, help="SOCKS5 Proxy (e.g., socks5://127.0.0.1:9050) for HTTP analyzers")
+
+    # Exports
     parser.add_argument("-oJ", "--out-json")
     parser.add_argument("-oC", "--out-csv")
     parser.add_argument("-oM", "--out-md")
@@ -38,9 +42,17 @@ async def main_async() -> None:
 
     args = parser.parse_args()
 
+    # uvloop inject for high speeds on Unix environments
+    if sys.platform != "win32":
+        try:
+            import uvloop
+            uvloop.install()
+        except ImportError:
+            pass
+
     console.print(Panel.fit(
-        "[bold cyan]OmniScan Titan ⚡ v1.0 (by 5f20)[/bold cyan]\n"
-        "[dim]Enterprise Asynchronous Network Intelligence Framework[/dim]",
+        "[bold cyan]OmniScan Titan ⚡ v2.0 (by 5f20)[/bold cyan]\n"
+        "[dim]3-Phase Adaptive Reconnaissance Framework (UDP/TCP/DoH/Nmap)[/dim]",
         border_style="cyan",
     ))
 
@@ -49,14 +61,13 @@ async def main_async() -> None:
     start_time = datetime.now()
 
     try:
-        if args.mode == "async":
+        if args.mode == "async": 
             await scanner.engine_async_socket()
-        elif args.mode == "nmap":
+        elif args.mode == "nmap": 
             await scanner.engine_nmap_subprocess()
-        elif args.mode == "hybrid":
+        elif args.mode == "hybrid": 
             await scanner.engine_hybrid()
 
-        # Display and export the gathered data
         scanner.display_results()
         export_results(scanner.results, args)
 
@@ -68,10 +79,8 @@ async def main_async() -> None:
         duration = datetime.now() - start_time
         console.print(f"\n[*] Execution Time: [bold yellow]{duration.total_seconds():.2f}s[/bold yellow].")
 
-
 if __name__ == "__main__":
     if sys.platform == "win32":
-        # Windows Proactor Event Loop fix for Subprocess calls
         asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
     try:
         asyncio.run(main_async())
