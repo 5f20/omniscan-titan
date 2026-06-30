@@ -1,12 +1,14 @@
 <div align="center">
 
 # ⚡ OmniScan Titan
-
 **Tactical Network Intelligence & Automated Vulnerability Mapping Framework**
 
 [![Python 3.8+](https://img.shields.io/badge/Python-3.8%2B-blue.svg?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=for-the-badge)](https://opensource.org/licenses/MIT)
 [![Engine: Asynchronous](https://img.shields.io/badge/Engine-Asynchronous-success.svg?style=for-the-badge)](https://docs.python.org/3/library/asyncio.html)
+[![Contributions Welcome](https://img.shields.io/badge/Contributions-Welcome-brightgreen.svg?style=for-the-badge)](#)
+
+<img src="assets/demo.gif" alt="OmniScan Titan Live Terminal Demo" width="800" style="border-radius: 10px; box-shadow: 0 4px 8px rgba(0,0,0,0.2); margin-top: 20px; margin-bottom: 20px;">
 
 </div>
 
@@ -30,23 +32,6 @@ In modern network engagements, **speed** and **stealth** are everything. Traditi
 | 🛡️ **Heuristic Fingerprinting** | Instantly flags critically outdated software and known CVEs (e.g., outdated OpenSSH, Apache path traversal, Mod_copy RCE) directly from raw banners. |
 | 🔍 **Context-Aware Protocol Analysis** | Distinguishes between HTTP, HTTPS, and raw TCP. Automatically rips SSL certificates (flagging MitM risks), parses HTTP server headers, and detects WAFs (Cloudflare, Imperva, AWS). |
 | 📊 **Real-Time Telemetry** | A rich, terminal-based UI providing live, color-coded intelligence routing and statistical analysis as the scan progresses. |
-
----
-
-<div align="center">
-
-# ⚡ OmniScan Titan
-**Tactical Network Intelligence & Automated Vulnerability Mapping Framework**
-
-[![Python 3.8+](https://img.shields.io/badge/Python-3.8%2B-blue.svg?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=for-the-badge)](https://opensource.org/licenses/MIT)
-[![Engine: Asynchronous](https://img.shields.io/badge/Engine-Asynchronous-success.svg?style=for-the-badge)](https://docs.python.org/3/library/asyncio.html)
-[![Contributions Welcome](https://img.shields.io/badge/Contributions-Welcome-brightgreen.svg?style=for-the-badge)](#)
-
-<img src="assets/demo.gif" alt="OmniScan Titan Live Terminal Demo" width="800" style="border-radius: 10px; box-shadow: 0 4px 8px rgba(0,0,0,0.2); margin-top: 20px; margin-bottom: 20px;"><br>
-*(Replace this placeholder URL with an actual GIF of your tool running. Tools like VHS or Asciinema are great for this)*
-
-</div>
 
 ---
 
