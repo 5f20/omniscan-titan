@@ -1,16 +1,19 @@
-import asyncio
 import os
 import sys
 import atexit
 import signal
-import threading
+import asyncio
 from typing import List, Any
 from rich.console import Console
 
 console = Console()
+
+# Kept for backward compatibility or future global tasks.
+# Phase 1 now uses atomic tempfile.TemporaryDirectory() for Nmap.
 _TEMP_FILES_REGISTRY: List[str] = []
 
 def _cleanup_temp_files() -> None:
+    """Fallback cleanup for any orphaned temporary files."""
     for path in _TEMP_FILES_REGISTRY:
         try:
             if os.path.exists(path):
@@ -21,30 +24,47 @@ def _cleanup_temp_files() -> None:
 atexit.register(_cleanup_temp_files)
 
 def optimize_os_limits(requested_workers: int) -> int:
-    """Aggressively maximizes OS file descriptors."""
+    """Aggressively maximizes OS file descriptors for peak concurrent performance."""
     if os.name != "nt":
         try:
             import resource
             soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+            
+            # Maximize File Descriptors
             target_limit = min(hard if hard > 0 else 1048576, 1048576)
             if soft < target_limit:
                 resource.setrlimit(resource.RLIMIT_NOFILE, (target_limit, hard))
+                
+            # Buffer of 100 FDs reserved for OS/Python internals
             return min(requested_workers, target_limit - 100)
         except Exception as e:
             console.print(f"[dim yellow][!] Limit optimization failed: {e}[/dim yellow]")
             return min(requested_workers, 1024)
-    return min(requested_workers, 1000) # Windows fallback
+            
+    # Windows fallback
+    return min(requested_workers, 1000) 
 
 def setup_signal_handlers(scanner: Any) -> None:
-    if threading.current_thread() is not threading.main_thread():
+    """Binds OS interrupt signals directly to the asyncio event loop."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
         return
 
-    def handle_sigint(sig: int, frame: Any) -> None:
+    def handle_sigint() -> None:
         if not scanner.shutdown_event.is_set():
-            console.print("\n[bold red]🚨 OPSEC Halt Initiated — Saving Intel...[/bold red]")
-            loop = asyncio.get_running_loop()
-            loop.call_soon_threadsafe(scanner.shutdown_event.set)
+            console.print("\n[bold red]🚨 OPSEC Halt Initiated — Safely closing connections...[/bold red]")
+            scanner.shutdown_event.set()
 
-    signal.signal(signal.SIGINT, handle_sigint)
+    # Native, non-blocking asyncio signal handling for Unix
     if sys.platform != "win32":
-        signal.signal(signal.SIGTERM, handle_sigint)
+        try:
+            loop.add_signal_handler(signal.SIGINT, handle_sigint)
+            loop.add_signal_handler(signal.SIGTERM, handle_sigint)
+        except NotImplementedError:
+            # Fallback for alternative event loops
+            signal.signal(signal.SIGINT, lambda sig, frame: loop.call_soon_threadsafe(handle_sigint))
+    else:
+        # Windows ProactorEventLoop does not support add_signal_handler natively
+        signal.signal(signal.SIGINT, lambda sig, frame: loop.call_soon_threadsafe(handle_sigint))
+        signal.signal(signal.SIGTERM, lambda sig, frame: loop.call_soon_threadsafe(handle_sigint))
