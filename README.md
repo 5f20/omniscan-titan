@@ -1,86 +1,74 @@
-# ⚡ OmniScan Titan
+<div align="center">
+  <!-- PLACEHOLDER: Create a sleek 1000x300 banner image with your logo -->
+  <img src="https://via.placeholder.com/1000x300/0f0f1b/00ffcc?text=OmniScan+Titan+⚡" alt="OmniScan Titan Banner">
 
-![Python 3.8+](https://img.shields.io/badge/Python-3.8%2B-blue.svg)
-![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
-![Mode: Asynchronous](https://img.shields.io/badge/Engine-Asynchronous-success.svg)
-![Build: Passing](https://img.shields.io/badge/Build-Passing-brightgreen.svg)
+  <h1>⚡ OmniScan Titan</h1>
+  <p><b>High-Performance, Asynchronous Network Intelligence & Vulnerability Mapping Framework</b></p>
 
-> **Tactical Network Intelligence & Automated Vulnerability Mapping Framework**
+  <p>
+    <a href="https://python.org"><img src="https://img.shields.io/badge/Python-3.8%2B-blue.svg?style=for-the-badge&logo=python" alt="Python 3.8+"></a>
+    <a href="https://github.com/5f20/omniscan-titan/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg?style=for-the-badge" alt="License"></a>
+    <a href="#"><img src="https://img.shields.io/badge/Engine-Asynchronous-success.svg?style=for-the-badge" alt="Engine"></a>
+  </p>
+</div>
 
-In modern network engagements, speed and stealth are everything. Traditional scanners are bloated and slow, often tripping alarms before the reconnaissance phase is even complete. **OmniScan Titan** was engineered to solve this.
+<br>
 
-Built from the ground up on Python's `asyncio` event loop, Titan utilizes multiplexed socket connections to sweep vast digital footprints in seconds. Once the perimeter is mapped, it seamlessly hands off active ports to a sandboxed Nmap subprocess, ensuring deep-packet inspection only occurs where it matters.
+> **Note:** In modern network engagements, speed and stealth are everything. Traditional scanners are bloated, slow, and often trip alarms before reconnaissance is even complete. **OmniScan Titan** was engineered to solve this.
+
+Built from the ground up on Python's `asyncio` event loop, Titan utilizes multiplexed socket connections to sweep vast digital footprints in seconds. Once the perimeter is mapped, it seamlessly hands off active ports to a sandboxed Nmap subprocess, ensuring deep-packet inspection only occurs exactly where it matters.
+
+---
+
+## 👁️ Live Telemetry in Action
+
+<!-- PLACEHOLDER: Record a high-quality GIF of your tool running. Use a tool like 'vhs' by Charmbracelet or 'Terminalizer' to make it look incredibly smooth and professional. -->
+<div align="center">
+  <img src="https://via.placeholder.com/800x450/1a1a2e/ffffff?text=[Insert+Terminal+GIF+Here]" alt="OmniScan Titan Demo">
+  <p><i>Titan sweeping a /24 subnet and dynamically passing targets to the DPI engine.</i></p>
+</div>
+
+---
+
+## 🏗️ The 3-Phase Architecture
+
+Unlike legacy synchronous scanners that wait for timeouts, Titan operates on a non-blocking asynchronous matrix.
+
+```mermaid
+graph LR
+    subgraph Phase 1: High-Speed Sweep
+    A[Target CIDRs / Domains] -->|Async Multiplexing| B(Raw Sockets)
+    end
+    
+    subgraph Phase 2: Interrogation
+    B -->|Open Ports| C{Banner Grab & TLS Rip}
+    C -->|HTTP/S| D[Extract Certs & Headers]
+    C -->|Raw TCP| E[Heuristic CVE Match]
+    end
+    
+    subgraph Phase 3: DPI Handoff
+    D --> F[Nmap Subprocess Sandbox]
+    E --> F
+    end
+    
+    F --> G[(Export: HTML, JSON, CSV, SQL)]
+```
+
+### 1️⃣ Discovery Phase
+Thousands of lightweight async workers fire parallel connection requests to the target pool, maximizing your OS's file descriptor limits (up to 65,000 concurrent sockets).
+
+### 2️⃣ Interrogation Phase
+Active sockets attempt smart banner grabbing. If HTTPS is detected, it auto-negotiates SSL/TLS to rip the underlying certificate data, identifies WAFs (Cloudflare, Imperva), and extracts server headers.
+
+### 3️⃣ Handoff Phase
+Confirmed active ports are securely batched and passed via temporary file descriptors to the Nmap engine for secondary, deep-packet validation without wasting time scanning closed ports.
+
+---
 
 ## 🦅 Tactical Capabilities
 
-* **Asynchronous Multiplexing:** Capable of sweeping tens of thousands of ports concurrently without exhausting operating system file descriptors.
-* **Hybrid Inspection Engine (HIE):** Connects raw socket discovery with Nmap's Deep Packet Inspection. Find the open doors instantly, then interrogate them thoroughly.
-* **Heuristic Fingerprinting:** Instantly flags critically outdated software and known CVEs (e.g., outdated OpenSSH, Apache path traversal, Mod_copy RCE) directly from raw banners.
-* **Context-Aware Protocol Analysis:** Distinguishes between HTTP, HTTPS, and raw TCP. Automatically extracts SSL certificate common names, HTTP server headers, and detects active Web Application Firewalls (WAFs) like Cloudflare, Imperva, and AWS.
-* **Real-Time Telemetry:** A Rich-powered terminal interface providing live, color-coded intelligence routing and statistical analysis as the scan progresses.
-
-### 🛡️ Recent Security & Performance Patches 24/06/2026
-* **DOM Bomb Protection:** Migrated to iterative XML parsing (`ET.iterparse`) to prevent memory exhaustion on gigabyte-sized Nmap outputs.
-* **CSV Armor:** Engineered strict sanitization to neutralize Excel macro/formula injections from malicious server banners.
-* **Zombie Process Eradication:** Implemented asynchronous cancellation traps to gracefully kill child Nmap binaries on user interrupts.
-* **Smart TLS Fallback:** Upgraded the HTTP analyzer to attempt strict verification first, falling back to unverified contexts while securely flagging MitM risks.
-
-## 🏗️ Architecture Overview
-
-Unlike legacy synchronous scanners that wait for timeouts, Titan operates on a non-blocking asynchronous matrix. 
-1. **Phase 1 (Discovery):** Thousands of lightweight workers fire parallel connection requests to the target pool.
-2. **Phase 2 (Interrogation):** Active sockets attempt smart banner grabbing. If HTTPS is detected, it auto-negotiates SSL/TLS to rip the underlying certificate data.
-3. **Phase 3 (Handoff):** Confirmed active ports are securely passed via temporary file descriptors to the Nmap engine for secondary validation.
-
-## ⚙️ Deployment Instructions
-
-**Prerequisites:** Python 3.8+ and `nmap` installed on the host OS.
-
-```text
-git clone https://github.com/5f20/omniscan-titan.git
-cd omniscan-titan
-pip install -r requirements.txt
-```
-
-## 🎯 Rules of Engagement (Usage)
-
-OmniScan Titan requires specific targets and port ranges. It can ingest single IPs, CIDR blocks, or massive text files of aggregated targets.
-
-**1. High-Speed Asynchronous Sweep (No Nmap):**
-```text
-python3 main.py -t 192.168.1.0/24 -p "80,443,8080-8090" -m async
-```
-
-**2. The Hybrid Approach (Async Discovery + Nmap DPI):**
-```text
-python3 main.py -t scanme.nmap.org -p "top" -m hybrid -oH intelligence_report.html
-```
-
-**3. Large-Scale Infrastructure Audit:**
-```text
-python3 main.py -iL scope_targets.txt -p "1-10000" -m hybrid -oJ data.json -w 2000
-```
-
-## 📊 Intelligence Exporting
-
-Titan supports comprehensive data exfiltration for post-engagement reporting:
-* `-oH report.html`: Generates a visually styled, boardroom-ready HTML report.
-* `-oJ report.json`: Clean JSON output for feeding into other automated SIEMs or pipelines.
-* `-oC report.csv`: Standardized CSV for spreadsheet analysis.
-* `-oS report.sqlite`: Dumps intelligence directly into a local relational database.
-
-## ☕ Support the Development
-
-If this tool has saved you time during a security engagement, helped secure your infrastructure, or you simply appreciate high-performance Python engineering, consider supporting the caffeine pipeline:
-
-<a href="https://buymeacoffee.com/144i" target="_blank">
-  <img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" style="height: 50px !important;width: 217px !important;">
-</a>
-
-## ⚖️ Legal Disclaimer (Hacker Ethics)
-
-**For Educational and Authorized Testing Purposes Only.**
-OmniScan Titan is designed strictly for security professionals, system administrators, and researchers to audit networks and applications they own or have explicit, written permission to test. The developers assume **no liability** and are not responsible for any misuse, damage, or illegal activity caused by this tool. Do not point this weapon at infrastructure you do not own.
-
-## 📄 License
-Released under the MIT License.
+* ⚡ **Asynchronous Multiplexing:** Capable of sweeping tens of thousands of ports concurrently without exhausting operating system file descriptors.
+* 🧠 **Hybrid Inspection Engine (HIE):** Connects raw socket discovery with Nmap's Deep Packet Inspection. Find the open doors instantly, then interrogate them thoroughly.
+* 🎯 **Heuristic Fingerprinting:** Instantly flags critically outdated software and known CVEs (e.g., outdated OpenSSH, Apache path traversal, Mod_copy RCE) directly from raw banners.
+* 🛡️ **Context-Aware Protocol Analysis:** Distinguishes between HTTP, HTTPS, and raw TCP. Automatically extracts SSL certificate common names, HTTP server headers, and detects active Web Application Firewalls.
+* 📊 **Real-Time Telemetry:** A Rich-powered terminal interface providing live, color-coded intelligence routing and statistical analysis as the scan progresses.
