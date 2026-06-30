@@ -42,7 +42,7 @@ async def main_async() -> None:
 
     args = parser.parse_args()
 
-    # uvloop inject for high speeds on Unix environments
+    # uvloop inject for maximum I/O performance on Unix environments
     if sys.platform != "win32":
         try:
             import uvloop
@@ -68,14 +68,19 @@ async def main_async() -> None:
         elif args.mode == "hybrid": 
             await scanner.engine_hybrid()
 
-        scanner.display_results()
-        export_results(scanner.results, args)
+        # Only process exports if the scan wasn't aborted early
+        if not scanner.shutdown_event.is_set():
+            scanner.display_results()
+            export_results(scanner.results, args)
 
     except asyncio.CancelledError:
-        pass
+        console.print("\n[dim yellow][!] Scan aborted by user. Exiting cleanly...[/dim yellow]")
     except Exception as exc:
         console.print(f"\n[bold red][!] Fatal Error: {exc}[/bold red]")
     finally:
+        # Failsafe: Destroy global HTTP session pool exactly ONCE
+        await scanner.close_session()
+        
         duration = datetime.now() - start_time
         console.print(f"\n[*] Execution Time: [bold yellow]{duration.total_seconds():.2f}s[/bold yellow].")
 
@@ -85,4 +90,5 @@ if __name__ == "__main__":
     try:
         asyncio.run(main_async())
     except KeyboardInterrupt:
+        # Fallback catch in case event loop was totally blocked
         pass
