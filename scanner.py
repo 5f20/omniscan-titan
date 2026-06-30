@@ -5,83 +5,104 @@ import os
 import sys
 import ssl
 import re
-import shlex
 import socket
+import shlex
 import tempfile
 import threading
 import shutil
 import random
+import aiohttp
 from typing import AsyncGenerator, Dict, Any, Set, List, Optional, Tuple
-from datetime import datetime
 
-# Import components from our separated modules
-from constants import PORT_SERVICES, WAF_SIGNATURES, USER_AGENTS, HEURISTICS, SAFE_NMAP_FLAGS, _SENTINEL
-from utils import _TEMP_FILES_REGISTRY
+from constants import PORT_SERVICES, WAF_SIGNATURES, USER_AGENTS, HEURISTICS, SAFE_NMAP_FLAGS, UDP_PAYLOADS, DOH_PROVIDERS, _SENTINEL
+from utils import _TEMP_FILES_REGISTRY, optimize_os_limits
 
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn
 from rich.panel import Panel
+from rich.layout import Layout
+from rich.live import Live
 from rich.tree import Tree
 from rich.table import Table
-from rich.live import Live
-from rich.layout import Layout
 
 console = Console()
 
 try:
     import defusedxml.ElementTree as ET
 except ImportError:
-    sys.exit(
-        "[FATAL] defusedxml is required: pip install defusedxml\n"
-        "Falling back to stdlib xml.etree.ElementTree is intentionally disabled "
-        "to prevent XXE attacks via malicious Nmap XML output."
-    )
+    sys.exit("[FATAL] defusedxml is required for secure XML parsing. Run: pip install defusedxml")
+
+class AdaptiveRateLimiter:
+    """Dynamically scales active socket connections to prevent network drops."""
+    def __init__(self, initial_limit: int):
+        self.limit = initial_limit
+        self.semaphore = asyncio.Semaphore(initial_limit)
+        self.timeout_count = 0
+        self.success_count = 0
+
+    def record_timeout(self):
+        self.timeout_count += 1
+        if self.timeout_count > 50:
+            self.timeout_count = 0
+            # AIMD: Multiplicative Decrease
+            if self.limit > 100:
+                self.limit = int(self.limit * 0.8)
+
+    def record_success(self):
+        self.success_count += 1
+        if self.success_count > 100:
+            self.success_count = 0
+            # AIMD: Additive Increase
+            self.limit += 50
+
+class UDPProbeProtocol(asyncio.DatagramProtocol):
+    def __init__(self, future: asyncio.Future):
+        self.future = future
+
+    def datagram_received(self, data: bytes, addr: Tuple[str, int]):
+        if not self.future.done():
+            self.future.set_result((data, addr))
+
+    def error_received(self, exc: Exception):
+        if not self.future.done():
+            self.future.set_exception(exc)
+
+    def connection_lost(self, exc: Exception):
+        if not self.future.done() and exc:
+            self.future.set_exception(exc)
 
 class OmniScanTitan:
     def __init__(self, args: argparse.Namespace) -> None:
-        self.max_workers = self._optimize_os_limits(args.workers)
+        self.max_workers = optimize_os_limits(args.workers)
         self.raw_targets = self._get_raw_targets(args.target, args.input_file)
         self.ports = self._parse_ports(args.ports)
         self.mode = args.mode
         self.timeout = args.timeout
         self.nmap_args = self._validate_nmap_args(args.nmap_args)
-
+        
+        # OPSEC & Privacy Features
+        self.doh = args.doh
+        self.udp_mode = args.udp
+        self.opsec = args.opsec
+        self.proxy = args.proxy
+        
         self.results: Dict[str, Dict[int, Dict[str, Any]]] = {}
         self.live_discoveries: List[str] = []
-        self.stats: Dict[str, Any] = {
-            "hosts_up": set(), "ports_open": 0, "vulns_found": 0
-        }
+        self.stats: Dict[str, Any] = {"hosts_up": set(), "ports_open": 0, "vulns_found": 0}
 
         self.lock = asyncio.Lock()
         self.shutdown_event = asyncio.Event()
-        self._dns_semaphore = asyncio.Semaphore(64)
-        self._thread_lock = threading.Lock()
-
-    @staticmethod
-    def _optimize_os_limits(requested_workers: int) -> int:
-        if os.name != "nt":
-            try:
-                import resource
-                soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-                target_limit = min(hard if hard > 0 else 65535, 65535)
-                if soft < target_limit:
-                    resource.setrlimit(resource.RLIMIT_NOFILE, (target_limit, hard))
-                return min(requested_workers, target_limit - 100)
-            except Exception:
-                return min(requested_workers, 1024)
-        return min(requested_workers, 1000)
+        self.rate_limiter = AdaptiveRateLimiter(self.max_workers)
+        self._dns_cache: Dict[str, str] = {}
 
     @staticmethod
     def _get_raw_targets(target_str: Optional[str], input_file: Optional[str]) -> Set[str]:
         raw: Set[str] = set()
-        if target_str:
+        if target_str: 
             raw.add(target_str)
         if input_file and os.path.exists(input_file):
             with open(input_file, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if line and not line.startswith("#"):
-                        raw.add(line)
+                raw.update([line.strip() for line in f if line.strip() and not line.startswith("#")])
         if not raw:
             console.print("[bold red][X] Error: No valid targets provided.[/bold red]")
             sys.exit(1)
@@ -89,486 +110,431 @@ class OmniScanTitan:
 
     @staticmethod
     def _parse_ports(port_string: str) -> List[int]:
-        if port_string.lower() == "top":
-            return list(PORT_SERVICES.keys())
-        if port_string.lower() == "all":
-            return list(range(1, 65536))
-
-        ports: Set[int] = set()
+        if port_string.lower() == "top": return list(PORT_SERVICES.keys())
+        if port_string.lower() == "all": return list(range(1, 65536))
+        ports = set()
         for part in port_string.split(","):
             part = part.strip()
-            if not part:
-                continue
             if "-" in part:
                 try:
-                    start, end = map(int, part.split("-", 1))
-                    ports.update(p for p in range(start, end + 1) if 1 <= p <= 65535)
-                except ValueError:
-                    pass
-            elif part.isdigit():
-                p = int(part)
-                if 1 <= p <= 65535:
-                    ports.add(p)
-        
-        if not ports:
-            console.print("[bold red][X] Error: No valid ports parsed.[/bold red]")
-            sys.exit(1)
+                    s, e = map(int, part.split("-", 1))
+                    ports.update(p for p in range(s, e + 1) if 1 <= p <= 65535)
+                except ValueError: pass
+            elif part.isdigit() and 1 <= int(part) <= 65535:
+                ports.add(int(part))
         return sorted(ports)
 
     @staticmethod
     def _validate_nmap_args(raw_args: str) -> List[str]:
-        try:
-            tokens = shlex.split(raw_args)
-        except ValueError as exc:
-            console.print(f"[bold red][!] Invalid --nmap-args quoting: {exc}[/bold red]")
-            sys.exit(1)
-
-        _SAFE_VALUE_RE = re.compile(r"^[A-Za-z0-9.\-_:]+$")
-        rejected: List[str] = []
-        for token in tokens:
-            if token.startswith("-"):
-                if token not in SAFE_NMAP_FLAGS:
-                    rejected.append(token)
-            else:
-                if not _SAFE_VALUE_RE.match(token):
-                    rejected.append(token)
-
+        tokens = shlex.split(raw_args)
+        rejected = [t for t in tokens if t.startswith("-") and t not in SAFE_NMAP_FLAGS]
         if rejected:
-            console.print(
-                f"[bold red][!] Unsafe/disallowed nmap token(s) rejected: {', '.join(rejected)}[/bold red]"
-            )
+            console.print(f"[bold red][!] Unsafe nmap flags rejected: {', '.join(rejected)}[/bold red]")
             sys.exit(1)
         return tokens
 
-    async def _resolve_target(self, target: str) -> AsyncGenerator[str, None]:
-        loop = asyncio.get_running_loop()
+    async def _resolve_doh(self, target: str) -> Optional[str]:
+        """Privacy-first DNS over HTTPS resolution to bypass ISP interception."""
+        if target in self._dns_cache: 
+            return self._dns_cache[target]
+            
+        endpoint = random.choice(DOH_PROVIDERS)
+        params = {"name": target, "type": "A"}
+        headers = {"Accept": "application/dns-json"}
         try:
-            if "/" in target:
-                for ip in ipaddress.IPv4Network(target, strict=False):
-                    yield str(ip)
-                return
-            try:
-                ipaddress.IPv4Address(target)
-                yield target
-                return
-            except ipaddress.AddressValueError:
-                pass
-
-            async with self._dns_semaphore:
-                try:
-                    info = await asyncio.wait_for(
-                        loop.getaddrinfo(target, None, family=socket.AF_INET),
-                        timeout=5.0,
-                    )
-                    yield info[0][4][0]
-                except (asyncio.TimeoutError, OSError):
-                    pass
+            async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=False)) as session:
+                async with session.get(endpoint, params=params, headers=headers, timeout=self.timeout) as resp:
+                    data = await resp.json()
+                    if data.get("Status") == 0 and "Answer" in data:
+                        ip = data["Answer"][0]["data"]
+                        self._dns_cache[target] = ip
+                        return ip
         except Exception:
+            pass
+        return None
+
+    async def _resolve_target(self, target: str) -> AsyncGenerator[str, None]:
+        if "/" in target:
+            for ip in ipaddress.IPv4Network(target, strict=False):
+                yield str(ip)
+            return
+        try:
+            ipaddress.IPv4Address(target)
+            yield target
+            return
+        except ipaddress.AddressValueError: 
+            pass
+
+        if self.doh:
+            ip = await self._resolve_doh(target)
+            if ip: 
+                yield ip
+                return
+
+        # Standard Fallback
+        try:
+            info = await asyncio.wait_for(
+                asyncio.get_running_loop().getaddrinfo(target, None, family=socket.AF_INET), timeout=5.0
+            )
+            yield info[0][4][0]
+        except Exception: 
             pass
 
     async def _target_generator(self) -> AsyncGenerator[Tuple[str, int], None]:
         for t in self.raw_targets:
             async for ip in self._resolve_target(t):
                 for port in self.ports:
-                    if self.shutdown_event.is_set():
+                    if self.shutdown_event.is_set(): 
                         return
                     yield (ip, port)
 
-    @staticmethod
-    def _check_heuristics(banner: str) -> List[str]:
-        return [name for regex, name in HEURISTICS.items() if re.search(regex, banner)]
-
-    async def _analyze_http(self, host: str, port: int, use_ssl: bool) -> str:
-        ua = random.choice(USER_AGENTS)
-        request = (
-            f"GET / HTTP/1.1\r\nHost: {host}\r\nUser-Agent: {ua}\r\n"
-            "Accept: */*\r\nConnection: close\r\n\r\n"
-        ).encode()
-        info_tags: List[str] = []
-        writer: Optional[asyncio.StreamWriter] = None
-        
+    # =========================================================================
+    # PHASE 1: HYPER-FAST RAW SOCKET DISCOVERY
+    # =========================================================================
+    async def _raw_tcp_check(self, host: str, port: int) -> bool:
+        """C-level socket implementation to bypass Python's asyncio overhead."""
+        loop = asyncio.get_running_loop()
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setblocking(False)
         try:
-            if use_ssl:
-                ctx_secure = ssl.create_default_context()
-                ctx_insecure = ssl.create_default_context()
-                ctx_insecure.check_hostname = False
-                ctx_insecure.verify_mode = ssl.CERT_NONE
-                ctx_insecure.options |= ssl.OP_LEGACY_SERVER_CONNECT
+            async with self.rate_limiter.semaphore:
+                await asyncio.wait_for(loop.sock_connect(sock, (host, port)), timeout=self.timeout)
+            self.rate_limiter.record_success()
+            return True
+        except asyncio.TimeoutError:
+            self.rate_limiter.record_timeout()
+            return False
+        except Exception:
+            return False
+        finally:
+            sock.close()
 
-                try:
-                    # Attempt secure TLS connection first
-                    reader, writer = await asyncio.wait_for(
-                        asyncio.open_connection(host, port, ssl=ctx_secure),
-                        timeout=self.timeout + 2,
-                    )
-                    cert = writer.get_extra_info("peercert")
-                    if cert:
-                        subj = dict(x[0] for x in cert.get("subject", []))
-                        info_tags.append(f"🔒 Valid SSL: {subj.get('commonName', 'Unknown')}")
-                except ssl.SSLError:
-                    # Fallback to unverified TLS for self-signed assets (tags MitM risk)
-                    reader, writer = await asyncio.wait_for(
-                        asyncio.open_connection(host, port, ssl=ctx_insecure),
-                        timeout=self.timeout + 2,
-                    )
-                    info_tags.append("⚠️ SSL: UNTRUSTED/MitM RISK")
-            else:
-                reader, writer = await asyncio.wait_for(
-                    asyncio.open_connection(host, port),
-                    timeout=self.timeout,
+    async def _raw_udp_check(self, host: str, port: int) -> bool:
+        loop = asyncio.get_running_loop()
+        payload = UDP_PAYLOADS.get(port, b"\x00" * 12)
+        fut = loop.create_future()
+        transport = None
+        try:
+            async with self.rate_limiter.semaphore:
+                transport, _ = await loop.create_datagram_endpoint(
+                    lambda: UDPProbeProtocol(fut), remote_addr=(host, port)
                 )
+                transport.sendto(payload)
+                await asyncio.wait_for(fut, timeout=self.timeout)
+            self.rate_limiter.record_success()
+            return True
+        except Exception:
+            self.rate_limiter.record_timeout()
+            return False
+        finally:
+            if transport: 
+                transport.close()
 
-            writer.write(request)
-            await writer.drain()
+    # =========================================================================
+    # PHASE 2: INTELLIGENCE INTERROGATION
+    # =========================================================================
+    async def _interrogate_http(self, host: str, port: int, use_ssl: bool) -> str:
+        url = f"{'https' if use_ssl else 'http'}://{host}:{port}/"
+        ua = random.choice(USER_AGENTS) if self.opsec else USER_AGENTS[0]
+        headers = {"User-Agent": ua, "Accept": "*/*"}
+        info_tags = []
+        
+        # OPSEC SOCKS Proxy logic
+        conn = None
+        if self.proxy:
+            try:
+                from aiohttp_socks import ProxyConnector
+                conn = ProxyConnector.from_url(self.proxy)
+            except ImportError:
+                console.print("[dim yellow][!] aiohttp-socks missing. Ignoring --proxy. Run: pip install aiohttp-socks[/dim yellow]")
 
-            resp_bytes = await asyncio.wait_for(reader.read(16384), timeout=self.timeout)
-            resp_str = resp_bytes.decode("utf-8", errors="replace")
-            lines = resp_str.splitlines()
-            if lines:
-                info_tags.append(f"[{lines[0].strip()[:80]}]")
-
-            headers = dict(re.findall(r"(?i)^([a-z0-9-]+):\s*(.+)$", resp_str, re.MULTILINE))
-
-            if "server" in headers:
-                srv = headers["server"].strip()
-                info_tags.append(f"Srv: {srv}")
-                if any(w in srv.lower() for w in WAF_SIGNATURES):
-                    info_tags.append("🛡️ WAF Detected")
-
-            if "x-powered-by" in headers:
-                info_tags.append(f"Tech: {headers['x-powered-by'].strip()}")
-
-            title = re.search(r"(?i)<title>(.*?)</title>", resp_str, re.DOTALL)
-            if title:
-                info_tags.append(f"Title: '{' '.join(title.group(1).split())[:45]}'")
-
+        try:
+            async with aiohttp.ClientSession(connector=conn, headers=headers) as session:
+                async with session.get(url, timeout=self.timeout + 1, ssl=False) as resp:
+                    srv = resp.headers.get("Server", "")
+                    if srv:
+                        info_tags.append(f"Srv: {srv}")
+                        if any(w in srv.lower() for w in WAF_SIGNATURES):
+                            info_tags.append("🛡️ WAF Detected")
+                    
+                    if "x-powered-by" in resp.headers:
+                        info_tags.append(f"Tech: {resp.headers['x-powered-by']}")
+                        
+                    html_content = await resp.text()
+                    title = re.search(r"(?i)<title>(.*?)</title>", html_content)
+                    if title: 
+                        info_tags.append(f"Title: '{' '.join(title.group(1).split())[:45]}'")
+                    
+            if use_ssl:
+                ctx = ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+                _, writer = await asyncio.wait_for(asyncio.open_connection(host, port, ssl=ctx), timeout=self.timeout)
+                cert = writer.get_extra_info("peercert")
+                if cert and "subject" in cert:
+                    subj = dict(x[0] for x in cert.get("subject", []))
+                    info_tags.append(f"🔒 SSL: {subj.get('commonName', 'Unknown')}")
+                writer.close()
+                await writer.wait_closed()
+                
             return " | ".join(info_tags) if info_tags else PORT_SERVICES.get(port, ("Unknown", "", ""))[0]
-
         except Exception:
             return PORT_SERVICES.get(port, ("Unknown", "", ""))[0]
-        finally:
-            if writer is not None:
-                try:
-                    writer.close()
-                    await writer.wait_closed()
-                except Exception:
-                    pass
 
-    async def _smart_banner_grab(self, host: str, port: int) -> str:
-        srv_name = PORT_SERVICES.get(port, ("Unknown", "white", "unknown"))[0]
+    async def _interrogate_tcp_banner(self, host: str, port: int) -> str:
+        srv_name = PORT_SERVICES.get(port, ("Unknown", "", ""))[0]
         if port in (443, 8443) or "https" in srv_name.lower():
-            return await self._analyze_http(host, port, use_ssl=True)
+            return await self._interrogate_http(host, port, True)
         if port in (80, 8080) or "http" in srv_name.lower():
-            return await self._analyze_http(host, port, use_ssl=False)
+            return await self._interrogate_http(host, port, False)
 
-        writer: Optional[asyncio.StreamWriter] = None
         try:
-            reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(host, port), timeout=self.timeout
-            )
+            reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=self.timeout)
             try:
                 data = await asyncio.wait_for(reader.read(1024), timeout=self.timeout)
+                if not data:
+                    writer.write(b"\r\n")
+                    await writer.drain()
+                    data = await asyncio.wait_for(reader.read(1024), timeout=self.timeout)
             except asyncio.TimeoutError:
-                writer.write(b"\r\n")
-                await writer.drain()
-                data = await asyncio.wait_for(reader.read(1024), timeout=self.timeout)
+                data = b""
+            writer.close()
+            await writer.wait_closed()
 
             if data:
-                clean = "".join(c if 32 <= ord(c) < 127 else " " for c in data.decode("utf-8", errors="replace"))
-                return clean.strip()[:80]
-        except Exception:
+                return "".join(c if 32 <= ord(c) < 127 else " " for c in data.decode("utf-8", "replace")).strip()[:80]
+        except Exception: 
             pass
-        finally:
-            if writer is not None:
-                try:
-                    writer.close()
-                    await writer.wait_closed()
-                except Exception:
-                    pass
-
+        
         return srv_name
 
     async def _worker(self, queue: asyncio.Queue, progress: Progress, task_id: int) -> None:
         while not self.shutdown_event.is_set():
             item = await queue.get()
             try:
-                if item is _SENTINEL or self.shutdown_event.is_set():
+                if item is _SENTINEL or self.shutdown_event.is_set(): 
                     break
-
                 host, port = item
-                banner = await self._smart_banner_grab(host, port)
-                srv_name, color, _ = PORT_SERVICES.get(port, ("Unknown", "white", "unknown"))
-                vulns = self._check_heuristics(banner)
-                vuln_str = f" [bold red]🚨 {', '.join(vulns)}[/bold red]" if vulns else ""
+                
+                # OPSEC Jitter
+                if self.opsec: 
+                    await asyncio.sleep(random.uniform(0.01, 0.1))
 
-                async with self.lock:
-                    if host not in self.results:
-                        self.results[host] = {}
-                    self.results[host][port] = {
-                        "state":   "open",
-                        "service": srv_name,
-                        "info":    banner,
-                        "vulns":   vulns,
-                    }
-                    self.stats["hosts_up"].add(host)
-                    self.stats["ports_open"] += 1
-                    self.stats["vulns_found"] += len(vulns)
+                # Phase 1: High-speed Raw Discovery
+                is_open = await self._raw_udp_check(host, port) if self.udp_mode else await self._raw_tcp_check(host, port)
+                
+                if is_open:
+                    # Phase 2: Deep Interrogation
+                    banner = "UDP Response Received" if self.udp_mode else await self._interrogate_tcp_banner(host, port)
+                    srv_name, color, _ = PORT_SERVICES.get(port, ("Unknown", "white", "unknown"))
+                    vulns = [name for reg, name in HEURISTICS.items() if re.search(reg, banner)]
+                    
+                    async with self.lock:
+                        if host not in self.results: 
+                            self.results[host] = {}
+                        self.results[host][port] = {
+                            "state": "open", "service": srv_name, "info": banner, "vulns": vulns
+                        }
+                        self.stats["hosts_up"].add(host)
+                        self.stats["ports_open"] += 1
+                        self.stats["vulns_found"] += len(vulns)
 
-                    msg = f"[[bold green]+[/bold green]] {host}:{port} -> [{color}]{srv_name}[/{color}] ({banner}){vuln_str}"
-                    self.live_discoveries.append(msg)
-                    if len(self.live_discoveries) > 8:
-                        self.live_discoveries.pop(0)
+                        proto = "UDP" if self.udp_mode else "TCP"
+                        vstr = f" [bold red]🚨 {', '.join(vulns)}[/bold red]" if vulns else ""
+                        self.live_discoveries.append(f"[[bold green]+[/bold green]] {host}:{port}/{proto} -> [{color}]{srv_name}[/{color}] ({banner}){vstr}")
+                        if len(self.live_discoveries) > 8: 
+                            self.live_discoveries.pop(0)
 
-            except Exception:
+            except Exception: 
                 pass
             finally:
                 progress.advance(task_id)
                 queue.task_done()
 
-    async def _feeder(self, queue: asyncio.Queue, progress: Progress, task_id: int, num_workers: int) -> None:
-        try:
-            total_items = 0
-            async for item in self._target_generator():
-                if self.shutdown_event.is_set():
-                    break
-                await queue.put(item)
-                total_items += 1
-                progress.update(task_id, total=total_items)
-        except Exception as exc:
-            console.print(f"[bold red]Feeder Error: {exc}[/bold red]")
-        finally:
-            for _ in range(num_workers):
-                await queue.put(_SENTINEL)
-
     async def engine_async_socket(self) -> None:
-        console.print(f"\n[*] Starting [bold blue]Titan Async Matrix[/bold blue] (Concurrency: {self.max_workers})")
+        mode_str = "[bold magenta]UDP Engine[/bold magenta]" if self.udp_mode else "[bold blue]TCP Multiplex Matrix[/bold blue]"
+        console.print(f"\n[*] Starting {mode_str} (Limit: {self.max_workers} FD)")
         queue: asyncio.Queue = asyncio.Queue(maxsize=self.max_workers * 2)
 
         progress = Progress(
-            SpinnerColumn("dots2"),
-            TextColumn("[bold blue]{task.description}"),
+            SpinnerColumn("dots2"), TextColumn("[bold blue]{task.description}"),
             BarColumn(complete_style="cyan", finished_style="green"),
             TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-            TimeElapsedColumn(),
-            TextColumn("[dim]Total: {task.total}[/dim]"),
+            TimeElapsedColumn(), TextColumn("[dim]Total: {task.total}[/dim]")
         )
         task_id = progress.add_task("Sweeping...", total=0)
 
-        feeder_task = asyncio.create_task(self._feeder(queue, progress, task_id, self.max_workers))
+        async def _feeder():
+            tot = 0
+            async for item in self._target_generator():
+                if self.shutdown_event.is_set(): 
+                    break
+                await queue.put(item)
+                tot += 1
+                progress.update(task_id, total=tot)
+            for _ in range(self.max_workers): 
+                await queue.put(_SENTINEL)
+
+        feeder_task = asyncio.create_task(_feeder())
         workers = [asyncio.create_task(self._worker(queue, progress, task_id)) for _ in range(self.max_workers)]
 
         with Live(refresh_per_second=10) as live:
             while not feeder_task.done() or not queue.empty() or not all(w.done() for w in workers):
                 if self.shutdown_event.is_set():
                     feeder_task.cancel()
-                    for w in workers:
+                    for w in workers: 
                         w.cancel()
                     break
                 async with self.lock:
-                    content = "\n".join(self.live_discoveries) if self.live_discoveries else "[dim]Scanning digital footprint...[/dim]"
-                    stats_str = (
-                        f"[green]Hosts Up:[/green] {len(self.stats['hosts_up'])} "
-                        f"| [cyan]Ports:[/cyan] {self.stats['ports_open']} "
-                        f"| [red]Vulns:[/red] {self.stats['vulns_found']}"
-                    )
-                combined = Layout()
-                combined.split_column(
+                    content = "\n".join(self.live_discoveries) if self.live_discoveries else "[dim]Scanning footprint...[/dim]"
+                    s = self.stats
+                    stats_str = f"[green]Hosts:[/green] {len(s['hosts_up'])} | [cyan]Ports:[/cyan] {s['ports_open']} | [red]Vulns:[/red] {s['vulns_found']} | [dim]Limit: {self.rate_limiter.limit}[/dim]"
+                
+                lay = Layout()
+                lay.split_column(
                     Layout(Panel(content, title="⚡ Live Telemetry", border_style="cyan"), ratio=3),
                     Layout(Panel(stats_str, border_style="green"), ratio=1),
-                    Layout(progress, ratio=1),
+                    Layout(progress, ratio=1)
                 )
-                live.update(combined)
+                live.update(lay)
                 await asyncio.sleep(0.1)
 
         await asyncio.gather(feeder_task, *workers, return_exceptions=True)
 
+    # =========================================================================
+    # PHASE 3: NMAP HANDOFF
+    # =========================================================================
     async def engine_nmap_subprocess(self, specific_targets: Optional[Dict[str, List[int]]] = None) -> None:
         if not shutil.which("nmap"):
-            console.print("[bold red][X] Nmap not found in PATH! Bypassing DPI engine.[/bold red]")
+            console.print("[bold red][X] Nmap binary missing. Bypassing DPI handoff.[/bold red]")
             return
-        if self.shutdown_event.is_set():
+        if self.shutdown_event.is_set() or self.udp_mode: 
             return
 
-        console.print("\n[*] Initiating [bold red]Nmap Deep Packet Inspection Engine[/bold red]")
-        nmap_tasks: List[Tuple[str, List[str], str]] = []
-        temp_files: List[str] = []
+        console.print("\n[*] Handoff: Initiating [bold red]Nmap Deep Packet Inspection Engine[/bold red]")
+        nmap_tasks = []
+        temp_files = []
 
         try:
             if specific_targets:
-                port_map: Dict[Tuple[int, ...], List[str]] = {}
-                for host, ports in specific_targets.items():
-                    if ports:
-                        port_map.setdefault(tuple(sorted(ports)), []).append(host)
+                port_map = {}
+                for host, pts in specific_targets.items():
+                    if pts: 
+                        port_map.setdefault(tuple(sorted(pts)), []).append(host)
 
                 for tup_ports, hosts in port_map.items():
-                    fd, path = tempfile.mkstemp(prefix="titan_targets_", text=True)
-                    with os.fdopen(fd, "w") as f:
+                    fd, path = tempfile.mkstemp(prefix="titan_tgt_", text=True)
+                    with os.fdopen(fd, "w") as f: 
                         f.write("\n".join(hosts))
                     xml_fd, xml_path = tempfile.mkstemp(prefix="titan_out_", suffix=".xml", text=True)
                     os.close(xml_fd)
                     temp_files.extend([path, xml_path])
                     _TEMP_FILES_REGISTRY.extend([path, xml_path])
 
-                    ports_str = ",".join(map(str, tup_ports))
-                    cmd = ["nmap"] + self.nmap_args + ["-p", ports_str, "-oX", xml_path, "-iL", path]
-                    nmap_tasks.append((f"{len(hosts)} hosts → ports {ports_str}", cmd, xml_path))
-            else:
-                resolved_ips: List[str] = []
-                for raw_target in self.raw_targets:
-                    async for ip in self._resolve_target(raw_target):
-                        resolved_ips.append(ip)
-
-                if not resolved_ips:
-                    return
-
-                fd, path = tempfile.mkstemp(prefix="titan_targets_", text=True)
-                with os.fdopen(fd, "w") as f:
-                    f.write("\n".join(resolved_ips))
-                xml_fd, xml_path = tempfile.mkstemp(prefix="titan_out_", suffix=".xml", text=True)
-                os.close(xml_fd)
-                temp_files.extend([path, xml_path])
-                _TEMP_FILES_REGISTRY.extend([path, xml_path])
-
-                ports_str = ",".join(map(str, self.ports))
-                cmd = ["nmap"] + self.nmap_args + ["-p", ports_str, "-oX", xml_path, "-iL", path]
-                nmap_tasks.append((f"{len(resolved_ips)} resolved hosts", cmd, xml_path))
-
-            if not nmap_tasks:
+                    pts_str = ",".join(map(str, tup_ports))
+                    cmd = ["nmap"] + self.nmap_args + ["-p", pts_str, "-oX", xml_path, "-iL", path]
+                    nmap_tasks.append((f"{len(hosts)} hosts → ports {pts_str}", cmd, xml_path))
+            
+            if not nmap_tasks: 
                 return
 
-            async def _run_nmap_task(desc: str, cmd: List[str], xml_out: str) -> None:
-                if self.shutdown_event.is_set():
+            async def _run(desc, cmd, xml_out):
+                if self.shutdown_event.is_set(): 
                     return
-                process = None
                 try:
-                    process = await asyncio.create_subprocess_exec(
-                        *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
-                    )
-                    await process.communicate()
+                    proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+                    await proc.communicate()
                     updates = await asyncio.to_thread(self._parse_nmap_xml, xml_out)
-                    
-                    if updates:
-                        async with self.lock:
-                            for addr, p_dict in updates.items():
-                                if addr not in self.results: 
-                                    self.results[addr] = {}
-                                for port_id, nd in p_dict.items():
-                                    existing = self.results[addr].get(port_id, {})
-                                    existing_banner = existing.get("info", "")
-                                    nmap_banner = nd["nmap_banner"]
-                                    
-                                    if nmap_banner:
-                                        final_banner = f"{existing_banner} ➕ Nmap: {nmap_banner}" if existing_banner and existing_banner != "Unknown" else nmap_banner
-                                    else:
-                                        final_banner = existing_banner or "No detailed banner"
-                                        
-                                    vulns = list(set(self._check_heuristics(final_banner) + existing.get("vulns", [])))
-                                    self.results[addr][port_id] = {"state": "open", "service": nd["service"], "info": final_banner, "vulns": vulns}
-                                    self.stats["hosts_up"].add(addr)
-                                    
+                    async with self.lock:
+                        for addr, pd in updates.items():
+                            if addr not in self.results: 
+                                self.results[addr] = {}
+                            for pid, nd in pd.items():
+                                ex = self.results[addr].get(pid, {})
+                                ex_ban = ex.get("info", "")
+                                nmap_ban = nd["nmap_banner"]
+                                f_ban = f"{ex_ban} ➕ Nmap: {nmap_ban}" if ex_ban and nmap_ban else nmap_ban or ex_ban
+                                vulns = list(set([name for r, name in HEURISTICS.items() if re.search(r, f_ban)] + ex.get("vulns", [])))
+                                self.results[addr][pid] = {"state": "open", "service": nd["service"], "info": f_ban, "vulns": vulns}
                 except asyncio.CancelledError:
-                    if process and process.returncode is None:
-                        try:
-                            process.terminate()
-                            await process.wait()
-                        except Exception:
-                            pass
-                    raise
-                except Exception as exc:
-                    console.print(f"[bold red][!] Nmap Error on {desc}: {exc}[/bold red]")
+                    pass
 
-            with Progress(SpinnerColumn("bouncingBall"), TextColumn("[red]{task.description}"), TimeElapsedColumn()) as progress:
-                progress.add_task(f"Executing {len(nmap_tasks)} Nmap task(s) in parallel...", total=len(nmap_tasks))
-                results = await asyncio.gather(
-                    *[_run_nmap_task(desc, cmd, xml_out) for desc, cmd, xml_out in nmap_tasks],
-                    return_exceptions=True,
-                )
-                for i, res in enumerate(results):
-                    if isinstance(res, Exception) and not isinstance(res, asyncio.CancelledError):
-                        console.print(f"[bold red][!] Nmap task '{nmap_tasks[i][0]}' failed: {res}[/bold red]")
+            with Progress(SpinnerColumn("bouncingBall"), TextColumn("[red]{task.description}"), TimeElapsedColumn()) as prog:
+                prog.add_task(f"Executing {len(nmap_tasks)} Nmap sandboxes...", total=len(nmap_tasks))
+                await asyncio.gather(*[_run(d, c, x) for d, c, x in nmap_tasks], return_exceptions=True)
 
         finally:
-            for path in temp_files:
+            for p in temp_files:
                 try:
-                    os.remove(path)
-                    if path in _TEMP_FILES_REGISTRY:
-                        _TEMP_FILES_REGISTRY.remove(path)
-                except OSError:
+                    os.remove(p)
+                    if p in _TEMP_FILES_REGISTRY: 
+                        _TEMP_FILES_REGISTRY.remove(p)
+                except OSError: 
                     pass
 
     def _parse_nmap_xml(self, xml_path: str) -> Dict[str, Dict[int, Dict[str, Any]]]:
-        updates: Dict[str, Dict[int, Dict[str, Any]]] = {}
+        updates = {}
         try:
-            if not os.path.exists(xml_path) or os.path.getsize(xml_path) == 0:
+            if not os.path.exists(xml_path) or os.path.getsize(xml_path) == 0: 
                 return updates
-                
-            context = ET.iterparse(xml_path, events=("end",))
-            for event, elem in context:
+            for event, elem in ET.iterparse(xml_path, events=("end",)):
                 if elem.tag == "host":
                     addr_elem = elem.find("address")
                     if addr_elem is None or not addr_elem.get("addr"):
                         elem.clear()
                         continue
-                    
                     addr = addr_elem.get("addr")
-                    host_data: Dict[int, Dict[str, Any]] = {}
-
+                    host_data = {}
                     for port_elem in elem.findall(".//port"):
                         try: 
-                            port_id = int(port_elem.get("portid", 0))
+                            pid = int(port_elem.get("portid", 0))
                         except ValueError: 
                             continue
-
-                        state_elem = port_elem.find("state")
-                        if state_elem is None or state_elem.get("state") not in ("open", "open|filtered"):
-                            continue
-
-                        srv = port_elem.find("service")
-                        name = srv.get("name", "unknown") if srv is not None else "unknown"
-                        product = srv.get("product", "") if srv is not None else ""
-                        version = srv.get("version", "") if srv is not None else ""
-                        nmap_banner = f"{product} {version}".strip()
-
-                        host_data[port_id] = {"state": "open", "service": name.upper(), "nmap_banner": nmap_banner}
-
-                    if host_data:
-                        updates[addr] = host_data
                         
+                        state_node = port_elem.find("state")
+                        if state_node is None or state_node.get("state") not in ("open", "open|filtered"): 
+                            continue
+                            
+                        srv = port_elem.find("service")
+                        nmap_banner = f"{srv.get('product', '')} {srv.get('version', '')}".strip() if srv is not None else ""
+                        host_data[pid] = {"service": srv.get("name", "unknown").upper() if srv is not None else "UNKNOWN", "nmap_banner": nmap_banner}
+                    
+                    if host_data: 
+                        updates[addr] = host_data
                     elem.clear()
-
-        except Exception as exc:
-            console.print(f"[dim red]Error processing Nmap output: {exc}[/dim red]")
-
+        except Exception: 
+            pass
         return updates
 
     async def engine_hybrid(self) -> None:
         await self.engine_async_socket()
-        if self.shutdown_event.is_set(): return
+        if self.shutdown_event.is_set(): 
+            return
         open_targets = {h: list(p.keys()) for h, p in self.results.items() if p}
-        if open_targets:
-            console.print(f"\n[*] Handoff: [bold green]{sum(len(p) for p in open_targets.values())}[/bold green] open ports transferred to Nmap engine.")
+        if open_targets and not self.udp_mode:
             await self.engine_nmap_subprocess(specific_targets=open_targets)
-        else:
-            console.print("\n[yellow][!] No open ports discovered. Bypassing Nmap engine.[/yellow]")
 
     def display_results(self) -> None:
         console.print("\n")
         has_results = False
+        proto = "udp" if self.udp_mode else "tcp"
         for host, ports in sorted(self.results.items()):
-            if not ports: continue
+            if not ports: 
+                continue
             has_results = True
             root_tree = Tree(f"🌐 [bold white]Host:[/bold white] [bold cyan]{host}[/bold cyan]")
             table = Table(show_header=True, header_style="bold magenta", box=None, padding=(0, 2))
-            table.add_column("Port"); table.add_column("State"); table.add_column("Service"); table.add_column("Vulnerability / App Info")
+            table.add_column("Port"); table.add_column("State"); table.add_column("Service"); table.add_column("App Intel / Vulnerability")
 
             for p in sorted(ports.keys()):
                 d = ports[p]
                 _, color, _ = PORT_SERVICES.get(p, ("Unknown", "white", "unknown"))
-                safe_info = str(d["info"]).replace("[", r"\[").replace("]", r"\]").replace(r"\[bold red]", "[bold red]").replace(r"\[/bold red]", "[/bold red]")
-                if d.get("vulns"): safe_info = f"[bold red]🚨 VULN: {', '.join(d['vulns'])}[/bold red] | " + safe_info
-                table.add_row(f"[{color}]{p}/tcp[/{color}]", "[bold green]OPEN[/bold green]", f"[{color}]{d['service']}[/{color}]", f"[dim white]{safe_info}[/dim white]")
+                safe_info = str(d["info"]).replace("[", r"\[").replace("]", r"\]")
+                if d.get("vulns"): 
+                    safe_info = f"[bold red]🚨 VULN: {', '.join(d['vulns'])}[/bold red] | " + safe_info
+                table.add_row(f"[{color}]{p}/{proto}[/{color}]", "[bold green]OPEN[/bold green]", f"[{color}]{d['service']}[/{color}]", f"[dim white]{safe_info}[/dim white]")
             root_tree.add(table)
             console.print(Panel(root_tree, border_style="cyan"))
 
         if not has_results:
-            console.print("[bold yellow][!] Scan complete. No open ports discovered.[/bold yellow]")
+            console.print("[bold yellow][!] Scan complete. Zero digital footprint detected.[/bold yellow]")
