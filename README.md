@@ -42,21 +42,9 @@ In modern network engagements, **speed** and **stealth** are everything. Traditi
 
 Unlike legacy synchronous scanners that wait for timeouts, Titan operates on a non-blocking asynchronous matrix. 
 
-```mermaid
-graph LR
-    A[Target Pool IP/CIDR] -->|Phase 1| B(Async Socket Sweeper)
-    B --> C{Port Open?}
-    C -->|No| D[Drop Connection]
-    C -->|Yes| E[Smart Banner Grab / TLS]
-    E -->|Phase 2| F(Heuristic CVE Matcher)
-    F -->|Phase 3| G[Nmap Handoff DPI]
-    G --> H[(SQLite / HTML / JSON)]
-    
-    style A fill:#16213e,stroke:#00ffcc,stroke-width:2px,color:#fff
-    style B fill:#0f3460,stroke:#00ffcc,stroke-width:2px,color:#fff
-    style G fill:#e94560,stroke:#fff,stroke-width:2px,color:#fff
-    style H fill:#1a1a2e,stroke:#00ffcc,stroke-width:2px,color:#fff
-```
+<div align="center">
+  <img src="https://i.imgur.com/EpKmpNy.png" alt="OmniScan Titan Architecture" width="800" style="border-radius: 10px; box-shadow: 0 4px 8px rgba(0,0,0,0.2); margin-top: 20px; margin-bottom: 20px;">
+</div>
 
 1. **Phase 1 (Discovery):** Thousands of lightweight workers fire parallel connection requests to the target pool.
 2. **Phase 2 (Interrogation):** Active sockets attempt smart banner grabbing. If HTTPS is detected, it auto-negotiates SSL/TLS to rip the underlying certificate data.
