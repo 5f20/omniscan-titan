@@ -33,17 +33,20 @@ In modern network engagements, **speed** and **stealth** are everything. Traditi
 
 ---
 
-## 🏗️ Architecture Overview
-
-Unlike legacy synchronous scanners that wait for timeouts, Titan operates on a non-blocking asynchronous matrix. 
-
 <div align="center">
-  <img src="https://i.imgur.com/EpKmpNy.png" alt="OmniScan Titan Architecture" width="800" style="border-radius: 10px; box-shadow: 0 4px 8px rgba(0,0,0,0.2); margin-top: 20px; margin-bottom: 20px;">
-</div>
 
-1. **Phase 1 (Discovery):** Thousands of lightweight workers fire parallel connection requests to the target pool.
-2. **Phase 2 (Interrogation):** Active sockets attempt smart banner grabbing. If HTTPS is detected, it auto-negotiates SSL/TLS to rip the underlying certificate data.
-3. **Phase 3 (Handoff):** Confirmed active ports are securely batched via temporary file descriptors to the Nmap engine for secondary validation.
+# ⚡ OmniScan Titan
+**Tactical Network Intelligence & Automated Vulnerability Mapping Framework**
+
+[![Python 3.8+](https://img.shields.io/badge/Python-3.8%2B-blue.svg?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=for-the-badge)](https://opensource.org/licenses/MIT)
+[![Engine: Asynchronous](https://img.shields.io/badge/Engine-Asynchronous-success.svg?style=for-the-badge)](https://docs.python.org/3/library/asyncio.html)
+[![Contributions Welcome](https://img.shields.io/badge/Contributions-Welcome-brightgreen.svg?style=for-the-badge)](#)
+
+<img src="assets/demo.gif" alt="OmniScan Titan Live Terminal Demo" width="800" style="border-radius: 10px; box-shadow: 0 4px 8px rgba(0,0,0,0.2); margin-top: 20px; margin-bottom: 20px;"><br>
+*(Replace this placeholder URL with an actual GIF of your tool running. Tools like VHS or Asciinema are great for this)*
+
+</div>
 
 ---
 
