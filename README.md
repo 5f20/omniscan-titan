@@ -7,11 +7,6 @@
 [![Python 3.8+](https://img.shields.io/badge/Python-3.8%2B-blue.svg?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=for-the-badge)](https://opensource.org/licenses/MIT)
 [![Engine: Asynchronous](https://img.shields.io/badge/Engine-Asynchronous-success.svg?style=for-the-badge)](https://docs.python.org/3/library/asyncio.html)
-[![Contributions Welcome](https://img.shields.io/badge/Contributions-Welcome-brightgreen.svg?style=for-the-badge)](#)
-
-<img src="https://raw.githubusercontent.com/5f20/omniscan-titan/main/assets/demo.gif" alt="OmniScan Titan Live Terminal Demo" width="800" style="border-radius: 10px; box-shadow: 0 4px 8px rgba(0,0,0,0.2); margin-top: 20px; margin-bottom: 20px;">
-<br>
-*(Replace this placeholder URL with an actual GIF of your tool running. Tools like VHS or Asciinema are great for this)*
 
 </div>
 
@@ -63,7 +58,7 @@ git clone https://github.com/5f20/omniscan-titan.git
 # Navigate into the directory
 cd omniscan-titan
 
-# Install dependencies (Rich, DefusedXML)
+# Install dependencies
 pip install -r requirements.txt
 ```
 
