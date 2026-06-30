@@ -38,7 +38,7 @@ In modern network engagements, **speed** and **stealth** are everything. Traditi
 Unlike legacy synchronous scanners that wait for timeouts, Titan operates on a non-blocking asynchronous matrix. 
 
 <div align="center">
-  <img src="assets/architecture.png" alt="OmniScan Titan Architecture" width="800" style="border-radius: 10px; box-shadow: 0 4px 8px rgba(0,0,0,0.2); margin-top: 20px; margin-bottom: 20px;">
+  <img src="https://i.imgur.com/EpKmpNy.png" alt="OmniScan Titan Architecture" width="800" style="border-radius: 10px; box-shadow: 0 4px 8px rgba(0,0,0,0.2); margin-top: 20px; margin-bottom: 20px;">
 </div>
 
 1. **Phase 1 (Discovery):** Thousands of lightweight workers fire parallel connection requests to the target pool.
