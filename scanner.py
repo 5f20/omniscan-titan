@@ -8,14 +8,14 @@ import re
 import socket
 import shlex
 import tempfile
-import threading
 import shutil
 import random
 import aiohttp
+import collections
 from typing import AsyncGenerator, Dict, Any, Set, List, Optional, Tuple
 
 from constants import PORT_SERVICES, WAF_SIGNATURES, USER_AGENTS, HEURISTICS, SAFE_NMAP_FLAGS, UDP_PAYLOADS, DOH_PROVIDERS, _SENTINEL
-from utils import _TEMP_FILES_REGISTRY, optimize_os_limits
+from utils import optimize_os_limits
 
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn
@@ -32,19 +32,47 @@ try:
 except ImportError:
     sys.exit("[FATAL] defusedxml is required for secure XML parsing. Run: pip install defusedxml")
 
-class AdaptiveRateLimiter:
-    """Dynamically scales active socket connections to prevent network drops."""
+class DynamicSemaphore:
+    """True token-bucket rate limiter, safe against cancellations and double-increments."""
     def __init__(self, initial_limit: int):
         self.limit = initial_limit
-        self.semaphore = asyncio.Semaphore(initial_limit)
+        self.active = 0
+        self.waiters = collections.deque()
         self.timeout_count = 0
         self.success_count = 0
+
+    async def __aenter__(self):
+        while self.active >= self.limit:
+            fut = asyncio.get_running_loop().create_future()
+            self.waiters.append(fut)
+            try:
+                await fut
+            except asyncio.CancelledError:
+                # Remove from waiters to prevent InvalidStateError on teardown
+                if not fut.done() and fut in self.waiters:
+                    self.waiters.remove(fut)
+                raise
+        
+        # Only increment ONCE, right before the task enters the active block
+        self.active += 1
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        self.active -= 1
+        self._wake_up_next()
+
+    def _wake_up_next(self):
+        # Wake up waiting tasks until we hit the dynamic limit
+        while self.waiters and self.active < self.limit:
+            fut = self.waiters.popleft()
+            if not fut.done():
+                fut.set_result(None)
+                # DO NOT increment self.active here. The task will do it in __aenter__
 
     def record_timeout(self):
         self.timeout_count += 1
         if self.timeout_count > 50:
             self.timeout_count = 0
-            # AIMD: Multiplicative Decrease
             if self.limit > 100:
                 self.limit = int(self.limit * 0.8)
 
@@ -52,8 +80,9 @@ class AdaptiveRateLimiter:
         self.success_count += 1
         if self.success_count > 100:
             self.success_count = 0
-            # AIMD: Additive Increase
             self.limit += 50
+            self._wake_up_next()
+
 
 class UDPProbeProtocol(asyncio.DatagramProtocol):
     def __init__(self, future: asyncio.Future):
@@ -71,6 +100,7 @@ class UDPProbeProtocol(asyncio.DatagramProtocol):
         if not self.future.done() and exc:
             self.future.set_exception(exc)
 
+
 class OmniScanTitan:
     def __init__(self, args: argparse.Namespace) -> None:
         self.max_workers = optimize_os_limits(args.workers)
@@ -80,7 +110,6 @@ class OmniScanTitan:
         self.timeout = args.timeout
         self.nmap_args = self._validate_nmap_args(args.nmap_args)
         
-        # OPSEC & Privacy Features
         self.doh = args.doh
         self.udp_mode = args.udp
         self.opsec = args.opsec
@@ -92,8 +121,26 @@ class OmniScanTitan:
 
         self.lock = asyncio.Lock()
         self.shutdown_event = asyncio.Event()
-        self.rate_limiter = AdaptiveRateLimiter(self.max_workers)
+        self.rate_limiter = DynamicSemaphore(self.max_workers)
         self._dns_cache: Dict[str, str] = {}
+        self.http_session: Optional[aiohttp.ClientSession] = None
+        self.compiled_heuristics = {re.compile(k): v for k, v in HEURISTICS.items()}
+
+    async def initialize_session(self):
+        conn = None
+        if self.proxy:
+            try:
+                from aiohttp_socks import ProxyConnector
+                conn = ProxyConnector.from_url(self.proxy)
+            except ImportError:
+                console.print("[dim yellow][!] aiohttp-socks missing. Ignoring --proxy.[/dim yellow]")
+        if not conn:
+            conn = aiohttp.TCPConnector(ssl=False)
+        self.http_session = aiohttp.ClientSession(connector=conn)
+
+    async def close_session(self):
+        if self.http_session:
+            await self.http_session.close()
 
     @staticmethod
     def _get_raw_targets(target_str: Optional[str], input_file: Optional[str]) -> Set[str]:
@@ -134,21 +181,23 @@ class OmniScanTitan:
         return tokens
 
     async def _resolve_doh(self, target: str) -> Optional[str]:
-        """Privacy-first DNS over HTTPS resolution to bypass ISP interception."""
         if target in self._dns_cache: 
             return self._dns_cache[target]
-            
         endpoint = random.choice(DOH_PROVIDERS)
         params = {"name": target, "type": "A"}
         headers = {"Accept": "application/dns-json"}
         try:
-            async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=False)) as session:
-                async with session.get(endpoint, params=params, headers=headers, timeout=self.timeout) as resp:
+            if not self.http_session:
+                return None
+            async with self.http_session.get(endpoint, params=params, headers=headers, timeout=self.timeout) as resp:
+                if resp.status == 200:
                     data = await resp.json()
                     if data.get("Status") == 0 and "Answer" in data:
                         ip = data["Answer"][0]["data"]
                         self._dns_cache[target] = ip
                         return ip
+        except asyncio.CancelledError:
+            raise
         except Exception:
             pass
         return None
@@ -164,6 +213,12 @@ class OmniScanTitan:
             return
         except ipaddress.AddressValueError: 
             pass
+        try:
+            ipaddress.IPv6Address(target)
+            yield target
+            return
+        except ipaddress.AddressValueError:
+            pass
 
         if self.doh:
             ip = await self._resolve_doh(target)
@@ -171,12 +226,13 @@ class OmniScanTitan:
                 yield ip
                 return
 
-        # Standard Fallback
         try:
             info = await asyncio.wait_for(
-                asyncio.get_running_loop().getaddrinfo(target, None, family=socket.AF_INET), timeout=5.0
+                asyncio.get_running_loop().getaddrinfo(target, None), timeout=5.0
             )
             yield info[0][4][0]
+        except asyncio.CancelledError:
+            raise
         except Exception: 
             pass
 
@@ -192,18 +248,21 @@ class OmniScanTitan:
     # PHASE 1: HYPER-FAST RAW SOCKET DISCOVERY
     # =========================================================================
     async def _raw_tcp_check(self, host: str, port: int) -> bool:
-        """C-level socket implementation to bypass Python's asyncio overhead."""
         loop = asyncio.get_running_loop()
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        family = socket.AF_INET6 if ':' in host else socket.AF_INET
+        sock = socket.socket(family, socket.SOCK_STREAM)
         sock.setblocking(False)
+
         try:
-            async with self.rate_limiter.semaphore:
+            async with self.rate_limiter:
                 await asyncio.wait_for(loop.sock_connect(sock, (host, port)), timeout=self.timeout)
             self.rate_limiter.record_success()
             return True
         except asyncio.TimeoutError:
             self.rate_limiter.record_timeout()
             return False
+        except asyncio.CancelledError:
+            raise
         except Exception:
             return False
         finally:
@@ -215,7 +274,7 @@ class OmniScanTitan:
         fut = loop.create_future()
         transport = None
         try:
-            async with self.rate_limiter.semaphore:
+            async with self.rate_limiter:
                 transport, _ = await loop.create_datagram_endpoint(
                     lambda: UDPProbeProtocol(fut), remote_addr=(host, port)
                 )
@@ -223,8 +282,12 @@ class OmniScanTitan:
                 await asyncio.wait_for(fut, timeout=self.timeout)
             self.rate_limiter.record_success()
             return True
-        except Exception:
+        except asyncio.TimeoutError:
             self.rate_limiter.record_timeout()
+            return False
+        except asyncio.CancelledError:
+            raise
+        except Exception:
             return False
         finally:
             if transport: 
@@ -239,45 +302,44 @@ class OmniScanTitan:
         headers = {"User-Agent": ua, "Accept": "*/*"}
         info_tags = []
         
-        # OPSEC SOCKS Proxy logic
-        conn = None
-        if self.proxy:
-            try:
-                from aiohttp_socks import ProxyConnector
-                conn = ProxyConnector.from_url(self.proxy)
-            except ImportError:
-                console.print("[dim yellow][!] aiohttp-socks missing. Ignoring --proxy. Run: pip install aiohttp-socks[/dim yellow]")
-
         try:
-            async with aiohttp.ClientSession(connector=conn, headers=headers) as session:
-                async with session.get(url, timeout=self.timeout + 1, ssl=False) as resp:
-                    srv = resp.headers.get("Server", "")
-                    if srv:
-                        info_tags.append(f"Srv: {srv}")
-                        if any(w in srv.lower() for w in WAF_SIGNATURES):
-                            info_tags.append("🛡️ WAF Detected")
+            if not self.http_session:
+                return PORT_SERVICES.get(port, ("Unknown", "", ""))[0]
+
+            async with self.http_session.get(url, headers=headers, timeout=self.timeout + 1) as resp:
+                srv = resp.headers.get("Server", "")
+                if srv:
+                    info_tags.append(f"Srv: {srv}")
+                    if any(w in srv.lower() for w in WAF_SIGNATURES):
+                        info_tags.append("🛡️ WAF Detected")
+                if "x-powered-by" in resp.headers:
+                    info_tags.append(f"Tech: {resp.headers['x-powered-by']}")
                     
-                    if "x-powered-by" in resp.headers:
-                        info_tags.append(f"Tech: {resp.headers['x-powered-by']}")
-                        
-                    html_content = await resp.text()
-                    title = re.search(r"(?i)<title>(.*?)</title>", html_content)
-                    if title: 
-                        info_tags.append(f"Title: '{' '.join(title.group(1).split())[:45]}'")
+                html_content = await resp.text()
+                title = re.search(r"(?i)<title>(.*?)</title>", html_content)
+                if title: 
+                    info_tags.append(f"Title: '{' '.join(title.group(1).split())[:45]}'")
                     
             if use_ssl:
                 ctx = ssl.create_default_context()
                 ctx.check_hostname = False
                 ctx.verify_mode = ssl.CERT_NONE
-                _, writer = await asyncio.wait_for(asyncio.open_connection(host, port, ssl=ctx), timeout=self.timeout)
-                cert = writer.get_extra_info("peercert")
-                if cert and "subject" in cert:
-                    subj = dict(x[0] for x in cert.get("subject", []))
-                    info_tags.append(f"🔒 SSL: {subj.get('commonName', 'Unknown')}")
-                writer.close()
-                await writer.wait_closed()
-                
+                reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port, ssl=ctx), timeout=self.timeout)
+                try:
+                    cert = writer.get_extra_info("peercert")
+                    if cert and "subject" in cert:
+                        subj = dict(x[0] for x in cert.get("subject", []))
+                        info_tags.append(f"🔒 SSL: {subj.get('commonName', 'Unknown')}")
+                finally:
+                    writer.close()
+                    try:
+                        await asyncio.wait_for(writer.wait_closed(), timeout=1.0)
+                    except Exception:
+                        pass
+                        
             return " | ".join(info_tags) if info_tags else PORT_SERVICES.get(port, ("Unknown", "", ""))[0]
+        except asyncio.CancelledError:
+            raise
         except Exception:
             return PORT_SERVICES.get(port, ("Unknown", "", ""))[0]
 
@@ -288,46 +350,54 @@ class OmniScanTitan:
         if port in (80, 8080) or "http" in srv_name.lower():
             return await self._interrogate_http(host, port, False)
 
+        writer = None
         try:
             reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=self.timeout)
             try:
-                data = await asyncio.wait_for(reader.read(1024), timeout=self.timeout)
+                data = await asyncio.wait_for(reader.read(1024), timeout=0.5)
                 if not data:
-                    writer.write(b"\r\n")
-                    await writer.drain()
-                    data = await asyncio.wait_for(reader.read(1024), timeout=self.timeout)
+                    raise asyncio.TimeoutError
             except asyncio.TimeoutError:
-                data = b""
-            writer.close()
-            await writer.wait_closed()
+                writer.write(b"\r\n\r\n")
+                await writer.drain()
+                try:
+                    data = await asyncio.wait_for(reader.read(1024), timeout=self.timeout)
+                except asyncio.TimeoutError:
+                    data = b""
 
             if data:
                 return "".join(c if 32 <= ord(c) < 127 else " " for c in data.decode("utf-8", "replace")).strip()[:80]
+        except asyncio.CancelledError:
+            raise
         except Exception: 
             pass
-        
+        finally:
+            if writer:
+                writer.close()
+                try:
+                    await asyncio.wait_for(writer.wait_closed(), timeout=1.0)
+                except Exception:
+                    pass
         return srv_name
 
     async def _worker(self, queue: asyncio.Queue, progress: Progress, task_id: int) -> None:
         while not self.shutdown_event.is_set():
-            item = await queue.get()
+            item = None
             try:
+                item = await queue.get()
                 if item is _SENTINEL or self.shutdown_event.is_set(): 
                     break
+                    
                 host, port = item
-                
-                # OPSEC Jitter
                 if self.opsec: 
                     await asyncio.sleep(random.uniform(0.01, 0.1))
 
-                # Phase 1: High-speed Raw Discovery
                 is_open = await self._raw_udp_check(host, port) if self.udp_mode else await self._raw_tcp_check(host, port)
                 
                 if is_open:
-                    # Phase 2: Deep Interrogation
                     banner = "UDP Response Received" if self.udp_mode else await self._interrogate_tcp_banner(host, port)
                     srv_name, color, _ = PORT_SERVICES.get(port, ("Unknown", "white", "unknown"))
-                    vulns = [name for reg, name in HEURISTICS.items() if re.search(reg, banner)]
+                    vulns = [name for compiled_reg, name in self.compiled_heuristics.items() if compiled_reg.search(banner)]
                     
                     async with self.lock:
                         if host not in self.results: 
@@ -345,13 +415,18 @@ class OmniScanTitan:
                         if len(self.live_discoveries) > 8: 
                             self.live_discoveries.pop(0)
 
+            except asyncio.CancelledError:
+                break 
             except Exception: 
                 pass
             finally:
-                progress.advance(task_id)
-                queue.task_done()
+                if item is not None:
+                    queue.task_done()
+                    if item is not _SENTINEL:
+                        progress.advance(task_id)
 
     async def engine_async_socket(self) -> None:
+        await self.initialize_session()
         mode_str = "[bold magenta]UDP Engine[/bold magenta]" if self.udp_mode else "[bold blue]TCP Multiplex Matrix[/bold blue]"
         console.print(f"\n[*] Starting {mode_str} (Limit: {self.max_workers} FD)")
         queue: asyncio.Queue = asyncio.Queue(maxsize=self.max_workers * 2)
@@ -408,69 +483,79 @@ class OmniScanTitan:
         if not shutil.which("nmap"):
             console.print("[bold red][X] Nmap binary missing. Bypassing DPI handoff.[/bold red]")
             return
-        if self.shutdown_event.is_set() or self.udp_mode: 
+        if self.shutdown_event.is_set(): 
+            return
+
+        if specific_targets is None:
+            await self.initialize_session()
+            specific_targets = {}
+            for t in self.raw_targets:
+                async for ip in self._resolve_target(t):
+                    specific_targets[ip] = self.ports
+
+        if not specific_targets:
             return
 
         console.print("\n[*] Handoff: Initiating [bold red]Nmap Deep Packet Inspection Engine[/bold red]")
         nmap_tasks = []
-        temp_files = []
+        nmap_semaphore = asyncio.Semaphore(10)
 
-        try:
-            if specific_targets:
-                port_map = {}
-                for host, pts in specific_targets.items():
-                    if pts: 
-                        port_map.setdefault(tuple(sorted(pts)), []).append(host)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            port_map = {}
+            for host, pts in specific_targets.items():
+                if pts: 
+                    port_map.setdefault(tuple(sorted(pts)), []).append(host)
 
-                for tup_ports, hosts in port_map.items():
-                    fd, path = tempfile.mkstemp(prefix="titan_tgt_", text=True)
-                    with os.fdopen(fd, "w") as f: 
-                        f.write("\n".join(hosts))
-                    xml_fd, xml_path = tempfile.mkstemp(prefix="titan_out_", suffix=".xml", text=True)
-                    os.close(xml_fd)
-                    temp_files.extend([path, xml_path])
-                    _TEMP_FILES_REGISTRY.extend([path, xml_path])
-
+            for tup_ports, hosts in port_map.items():
+                # OS ARG_MAX protection
+                if len(tup_ports) > 500:
+                    pts_str = f"{min(tup_ports)}-{max(tup_ports)}"
+                else:
                     pts_str = ",".join(map(str, tup_ports))
-                    cmd = ["nmap"] + self.nmap_args + ["-p", pts_str, "-oX", xml_path, "-iL", path]
-                    nmap_tasks.append((f"{len(hosts)} hosts → ports {pts_str}", cmd, xml_path))
-            
-            if not nmap_tasks: 
-                return
+                    
+                safe_name = pts_str.replace(",", "_")[:50]
+                
+                path = os.path.join(tmpdir, f"targets_{safe_name}.txt")
+                xml_path = os.path.join(tmpdir, f"out_{safe_name}.xml")
+                
+                with open(path, "w") as f: 
+                    f.write("\n".join(hosts))
 
-            async def _run(desc, cmd, xml_out):
+                base_args = self.nmap_args.copy()
+                if self.udp_mode and "-sU" not in base_args:
+                    base_args.append("-sU")
+                    
+                cmd = ["nmap"] + base_args + ["-p", pts_str, "-oX", xml_path, "-iL", path]
+                nmap_tasks.append((f"{len(hosts)} hosts → ports {pts_str}", cmd, xml_path))
+
+            async def _run_safely(desc, cmd, xml_out):
                 if self.shutdown_event.is_set(): 
                     return
-                try:
-                    proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
-                    await proc.communicate()
-                    updates = await asyncio.to_thread(self._parse_nmap_xml, xml_out)
-                    async with self.lock:
-                        for addr, pd in updates.items():
-                            if addr not in self.results: 
-                                self.results[addr] = {}
-                            for pid, nd in pd.items():
-                                ex = self.results[addr].get(pid, {})
-                                ex_ban = ex.get("info", "")
-                                nmap_ban = nd["nmap_banner"]
-                                f_ban = f"{ex_ban} ➕ Nmap: {nmap_ban}" if ex_ban and nmap_ban else nmap_ban or ex_ban
-                                vulns = list(set([name for r, name in HEURISTICS.items() if re.search(r, f_ban)] + ex.get("vulns", [])))
-                                self.results[addr][pid] = {"state": "open", "service": nd["service"], "info": f_ban, "vulns": vulns}
-                except asyncio.CancelledError:
-                    pass
+                async with nmap_semaphore:
+                    try:
+                        proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+                        await proc.communicate()
+                        updates = await asyncio.to_thread(self._parse_nmap_xml, xml_out)
+                        async with self.lock:
+                            for addr, pd in updates.items():
+                                if addr not in self.results: 
+                                    self.results[addr] = {}
+                                for pid, nd in pd.items():
+                                    ex = self.results[addr].get(pid, {})
+                                    ex_ban = ex.get("info", "")
+                                    nmap_ban = nd["nmap_banner"]
+                                    f_ban = f"{ex_ban} ➕ Nmap: {nmap_ban}" if ex_ban and nmap_ban else nmap_ban or ex_ban
+                                    
+                                    vulns = list(set([name for compiled_reg, name in self.compiled_heuristics.items() if compiled_reg.search(f_ban)] + ex.get("vulns", [])))
+                                    self.results[addr][pid] = {"state": "open", "service": nd["service"], "info": f_ban, "vulns": vulns}
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        pass
 
             with Progress(SpinnerColumn("bouncingBall"), TextColumn("[red]{task.description}"), TimeElapsedColumn()) as prog:
                 prog.add_task(f"Executing {len(nmap_tasks)} Nmap sandboxes...", total=len(nmap_tasks))
-                await asyncio.gather(*[_run(d, c, x) for d, c, x in nmap_tasks], return_exceptions=True)
-
-        finally:
-            for p in temp_files:
-                try:
-                    os.remove(p)
-                    if p in _TEMP_FILES_REGISTRY: 
-                        _TEMP_FILES_REGISTRY.remove(p)
-                except OSError: 
-                    pass
+                await asyncio.gather(*[_run_safely(d, c, x) for d, c, x in nmap_tasks], return_exceptions=True)
 
     def _parse_nmap_xml(self, xml_path: str) -> Dict[str, Dict[int, Dict[str, Any]]]:
         updates = {}
@@ -511,7 +596,7 @@ class OmniScanTitan:
         if self.shutdown_event.is_set(): 
             return
         open_targets = {h: list(p.keys()) for h, p in self.results.items() if p}
-        if open_targets and not self.udp_mode:
+        if open_targets:
             await self.engine_nmap_subprocess(specific_targets=open_targets)
 
     def display_results(self) -> None:
