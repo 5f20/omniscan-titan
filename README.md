@@ -8,7 +8,7 @@
 [![Engine: Asynchronous](https://img.shields.io/badge/Engine-Asynchronous-success.svg?style=for-the-badge)](https://docs.python.org/3/library/asyncio.html)
 [![Contributions Welcome](https://img.shields.io/badge/Contributions-Welcome-brightgreen.svg?style=for-the-badge)](#)
 
-<img src="https://raw.githubusercontent.com/5f20/omniscan-titan/main/assets/demo_v2.gif" alt="OmniScan Titan Live Terminal Demo" width="800" style="border-radius: 10px; box-shadow: 0 4px 8px rgba(0,0,0,0.2); margin-top: 20px; margin-bottom: 20px;">
+<img src="https://raw.githubusercontent.com/5f20/omniscan-titan/main/assets/titan_titan_demo.gif" alt="OmniScan Titan Live Terminal Demo" width="800" style="border-radius: 10px; box-shadow: 0 4px 8px rgba(0,0,0,0.2); margin-top: 20px; margin-bottom: 20px;">
 
 </div>
 

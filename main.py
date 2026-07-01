@@ -78,8 +78,6 @@ async def main_async() -> None:
     except Exception as exc:
         console.print(f"\n[bold red][!] Fatal Error: {exc}[/bold red]")
     finally:
-        # Failsafe: Destroy global HTTP session pool exactly ONCE
-        await scanner.close_session()
         
         duration = datetime.now() - start_time
         console.print(f"\n[*] Execution Time: [bold yellow]{duration.total_seconds():.2f}s[/bold yellow].")
