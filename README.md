@@ -10,7 +10,7 @@
 
 <br>
 
-![OmniScan Titan Live Terminal Demo](assets/final_demo.gif)
+![OmniScan Titan Live Terminal Demo](assets/pristine_demo.gif)
 
 </div>
 
