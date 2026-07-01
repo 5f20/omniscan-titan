@@ -41,7 +41,7 @@ In modern network engagements, **speed** and **stealth** are everything. Traditi
 
 ```bash
 # Clone the repository
-git clone https://github.com/5f20/omniscan-titan.git
+git clone [https://github.com/5f20/omniscan-titan.git](https://github.com/5f20/omniscan-titan.git)
 
 # Navigate into the directory
 cd omniscan-titan
