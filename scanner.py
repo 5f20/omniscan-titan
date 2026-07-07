@@ -41,6 +41,7 @@ class OmniScanTitan:
         self.timeout = args.timeout
         self.nmap_args = self._validate_nmap_args(args.nmap_args)
         self.udp_enabled = getattr(args, 'udp', False)
+        self.opsec = getattr(args, 'opsec', False)
 
         # Network Traffic Controllers
         self.global_bucket = TokenBucket(rate=getattr(args, 'global_rate', 1000.0), capacity=getattr(args, 'global_burst', 2000))
@@ -61,17 +62,20 @@ class OmniScanTitan:
         self.http_session: Optional[aiohttp.ClientSession] = None
 
     @staticmethod
-    def _get_raw_targets(target_str: Optional[str], input_file: Optional[str]) -> Set[str]:
-        raw = set()
-        if target_str: 
-            raw.add(target_str)
+    def _get_raw_targets(target_str: Optional[str], input_file: Optional[str]):
+        found = False
+        if target_str:
+            found = True
+            yield target_str
         if input_file and os.path.exists(input_file):
             with open(input_file, "r", encoding="utf-8") as f:
-                for line in (x.strip() for x in f if x.strip() and not x.startswith("#")):
-                    raw.add(line)
-        if not raw:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        found = True
+                        yield line
+        if not found:
             sys.exit("[bold red][X] Error: No valid targets provided.[/bold red]")
-        return raw
 
     @staticmethod
     def _parse_ports(port_string: str) -> List[int]:
