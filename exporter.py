@@ -18,16 +18,19 @@ def _sanitize_csv(value: Any) -> str:
     return val_str
 
 async def export_json_stream(path: str, items: Iterable[Dict[str, Any]]):
-    """Streams data to JSON format sequentially to maintain a flat memory profile."""
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("[\n")
-        first = True
-        for item in items:
-            if not first: 
-                f.write(",\n")
-            json.dump(item, f, ensure_ascii=False)
-            first = False
-        f.write("\n]\n")
+    def _write_json():
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("[\n")
+            first = True
+            for item in items:
+                if not first: 
+                    f.write(",\n")
+                json.dump(item, f, ensure_ascii=False)
+                first = False
+            f.write("\n]\n")
+            
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, _write_json)
     console.print(f"[+] Exported JSON Stream -> [bold green]{path}[/bold green]")
 
 async def export_csv_stream(path: str, items: Iterable[Dict[str, Any]]):
