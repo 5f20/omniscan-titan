@@ -1,86 +1,106 @@
 import sys
 import asyncio
 import argparse
+import platform
 from datetime import datetime
 from rich.console import Console
 from rich.panel import Panel
 
 from scanner import OmniScanTitan
-from utils import setup_signal_handlers
-from exporter import export_results
+from exporter import export_json_stream, export_csv_stream, export_sqlite, export_html
 
 console = Console()
 
+def setup_signal_handlers(scanner):
+    """Hooks into OS level interrupt signals for graceful degradation."""
+    try:
+        loop = asyncio.get_running_loop()
+        def handle():
+            scanner.shutdown_event.set()
+            console.print("\n[bold red]🚨 Halt Initiated...[/bold red]")
+        if sys.platform != "win32":
+            import signal
+            loop.add_signal_handler(signal.SIGINT, handle)
+    except Exception:
+        pass
+
 async def main_async() -> None:
-    parser = argparse.ArgumentParser(
-        description="OmniScan Titan ⚡ v2.0 (by 5f20) — Advanced Enterprise Recon Framework",
-        formatter_class=argparse.RawTextHelpFormatter,
-    )
-
-    tg = parser.add_mutually_exclusive_group(required=True)
-    tg.add_argument("-t", "--target", help="Target IP, hostname, or CIDR (e.g., 10.0.0.0/24)")
-    tg.add_argument("-iL", "--input-file", help="File containing one target per line")
-
-    parser.add_argument("-p", "--ports", required=True, help="Ports: '80,443', '1-1000', 'top', or 'all'")
-    parser.add_argument("-m", "--mode", choices=["async", "nmap", "hybrid"], default="hybrid")
-    parser.add_argument("--nmap-args", default="-sV -sC -Pn -T4 --version-light", help="Allowlisted nmap flags only")
-    parser.add_argument("-w", "--workers", type=int, default=2500, help="Initial FD Concurrency Limit")
-    parser.add_argument("--timeout", type=float, default=1.5, help="Socket timeout")
+    parser = argparse.ArgumentParser(description="OmniScan Titan ⚡ Network Intelligence Framework")
+    parser.add_argument("-t", "--target", help="Target IP/CIDR", required=True)
+    parser.add_argument("-iL", "--input-file", help="File of targets")
+    parser.add_argument("-p", "--ports", default="top", help="Ports (e.g. 80,443 or top)")
+    parser.add_argument("-m", "--mode", choices=["async", "hybrid"], default="hybrid")
+    parser.add_argument("-w", "--workers", type=int, default=2000, help="Async FD Limit")
+    parser.add_argument("--timeout", type=float, default=2.0)
+    parser.add_argument("--udp", action="store_true", help="Enable UDP probe payloads")
+    parser.add_argument("--nmap-args", default="-sV -Pn -T4")
     
-    # Advanced / OPSEC Features
-    parser.add_argument("--udp", action="store_true", help="Enable UDP scanning with deep payloads")
-    parser.add_argument("--doh", action="store_true", help="Use DNS over HTTPS (Cloudflare/Google) to prevent ISP snooping")
-    parser.add_argument("--opsec", action="store_true", help="Enable Stealth Mode (Jitter, UA rotation, AIMD limits)")
-    parser.add_argument("--proxy", type=str, help="SOCKS5 Proxy (e.g., socks5://127.0.0.1:9050) for HTTP analyzers")
-
-    # Exports
+    # Mathematical Constraints
+    parser.add_argument("--global-rate", type=float, default=1500.0)
+    parser.add_argument("--global-burst", type=int, default=3000)
+    parser.add_argument("--per-host-conn", type=int, default=20)
+    parser.add_argument("--max-connections", type=int, default=2500)
+    parser.add_argument("--conn-ttl", type=float, default=30.0)
+    
+    # Exfiltration Handling
     parser.add_argument("-oJ", "--out-json")
     parser.add_argument("-oC", "--out-csv")
-    parser.add_argument("-oM", "--out-md")
-    parser.add_argument("-oH", "--out-html")
     parser.add_argument("-oS", "--out-sql")
+    parser.add_argument("-oH", "--out-html")
 
     args = parser.parse_args()
 
-    # uvloop inject for maximum I/O performance on Unix environments
     if sys.platform != "win32":
         try:
             import uvloop
             uvloop.install()
-        except ImportError:
+        except ImportError: 
             pass
 
     console.print(Panel.fit(
-        "[bold cyan]OmniScan Titan ⚡ v2.0 (by 5f20)[/bold cyan]\n"
-        "[dim]3-Phase Adaptive Reconnaissance Framework (UDP/TCP/DoH/Nmap)[/dim]",
-        border_style="cyan",
+        "[bold cyan]OmniScan Titan ⚡[/bold cyan]\n"
+        "[dim]High-Performance Async/UDP/TCP Recon Engine[/dim]", 
+        border_style="cyan"
     ))
-
+    
     scanner = OmniScanTitan(args)
     setup_signal_handlers(scanner)
-    start_time = datetime.now()
+    start = datetime.now()
 
     try:
         if args.mode == "async": 
             await scanner.engine_async_socket()
-        elif args.mode == "nmap": 
-            await scanner.engine_nmap_subprocess()
-        elif args.mode == "hybrid": 
+        else: 
             await scanner.engine_hybrid()
 
-        # Only process exports if the scan wasn't aborted early
-        if not scanner.shutdown_event.is_set():
-            scanner.display_results()
-            export_results(scanner.results, args)
+        # Generates a flat stream for O(1) memory writing
+        def iter_results():
+            for host, ports in scanner.results.items():
+                for port, d in ports.items():
+                    yield {
+                        "host": host, 
+                        "port": port, 
+                        "state": d.get("state"), 
+                        "service": d.get("service"), 
+                        "info": d.get("info"), 
+                        "vulns": d.get("vulns", [])
+                    }
+
+        if args.out_json: 
+            await export_json_stream(args.out_json, iter_results())
+        if args.out_csv: 
+            await export_csv_stream(args.out_csv, iter_results())
+        if args.out_sql: 
+            await export_sqlite(args.out_sql, iter_results())
+        if args.out_html: 
+            export_html(args.out_html, iter_results()) 
 
     except asyncio.CancelledError:
-        console.print("\n[dim yellow][!] Scan aborted by user. Exiting cleanly...[/dim yellow]")
-    except Exception as exc:
-        console.print(f"\n[bold red][!] Fatal Error: {exc}[/bold red]")
+        pass
     finally:
-        
-        duration = datetime.now() - start_time
-        console.print(f"\n[*] Execution Time: [bold yellow]{duration.total_seconds():.2f}s[/bold yellow].")
+        # Ensures child processing resources are cleanly destroyed
+        scanner.process_pool.shutdown(wait=False)
+        console.print(f"\n[*] Execution Time: [bold yellow]{(datetime.now() - start).total_seconds():.2f}s[/bold yellow]")
 
 if __name__ == "__main__":
     if sys.platform == "win32":
@@ -88,5 +108,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main_async())
     except KeyboardInterrupt:
-        # Fallback catch in case event loop was totally blocked
         pass
