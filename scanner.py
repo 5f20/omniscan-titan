@@ -236,9 +236,13 @@ class OmniScanTitan:
                 if proto == "udp": 
                     banner = f"[UDP] {banner}"
 
+                # 1. Do all heavy lifting OUTSIDE the lock
                 srv_name, color, _ = PORT_SERVICES.get(port, ("Unknown", "white", "unknown"))
                 vulns = [name for regex, name in HEURISTICS.items() if re.search(regex, banner)]
+                vuln_str = f" [bold red]🚨 {', '.join(vulns)}[/bold red]" if vulns else ""
+                msg = f"[[bold green]+[/bold green]] {host}:{port} -> [{color}]{srv_name}[/{color}] ({banner}){vuln_str}"
 
+                # 2. Keep the lock incredibly brief
                 async with self.lock:
                     if host not in self.results: 
                         self.results[host] = {}
@@ -250,11 +254,7 @@ class OmniScanTitan:
                     else:
                         self.results[host][port]["info"] += f" | {banner}"
 
-                    vuln_str = f" [bold red]🚨 {', '.join(vulns)}[/bold red]" if vulns else ""
-                    msg = f"[[bold green]+[/bold green]] {host}:{port} -> [{color}]{srv_name}[/{color}] ({banner}){vuln_str}"
                     self.live_discoveries.append(msg)
-                    if len(self.live_discoveries) > 8: 
-                        self.live_discoveries.pop(0)
 
             except Exception: 
                 pass
