@@ -17,10 +17,15 @@ def setup_signal_handlers(scanner):
         loop = asyncio.get_running_loop()
         def handle():
             scanner.shutdown_event.set()
-            console.print("\n[bold red]🚨 Halt Initiated...[/bold red]")
+            console.print("\n[bold red]🚨 Halt Initiated... Canceling tasks.[/bold red]")
+            current_task = asyncio.current_task(loop)
+            for task in asyncio.all_tasks(loop):
+                if task is not current_task and not task.done():
+                    task.cancel()
         if sys.platform != "win32":
             import signal
             loop.add_signal_handler(signal.SIGINT, handle)
+            loop.add_signal_handler(signal.SIGTERM, handle)
     except Exception:
         pass
 
@@ -33,6 +38,7 @@ async def main_async() -> None:
     parser.add_argument("-w", "--workers", type=int, default=2000, help="Async FD Limit")
     parser.add_argument("--timeout", type=float, default=2.0)
     parser.add_argument("--udp", action="store_true", help="Enable UDP probe payloads")
+    parser.add_argument("--opsec", action="store_true", help="Enable adaptive scan jitter")
     parser.add_argument("--nmap-args", default="-sV -Pn -T4")
     
     # Mathematical Constraints
