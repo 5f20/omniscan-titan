@@ -10,6 +10,7 @@ class PooledConnection:
         self.writer = writer
         self.created_at = created_at
         self.in_use = False
+        self.untrusted_ssl = False
 
     async def close(self):
         try:
