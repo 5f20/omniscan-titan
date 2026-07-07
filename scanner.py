@@ -202,7 +202,10 @@ class OmniScanTitan:
             
             data = await asyncio.wait_for(reader.read(1024), timeout=self.timeout)
             if data:
-                return "".join(c if 32 <= ord(c) < 127 else " " for c in data.decode("utf-8", errors="replace")).strip()[:160]
+                banner = "".join(c if 32 <= ord(c) < 127 else " " for c in data.decode("utf-8", errors="replace")).strip()[:160]
+                if getattr(conn, 'untrusted_ssl', False):
+                    banner = f"[MitM RISK / Untrusted SSL] {banner}"
+                return banner
         except Exception:
             pass
         finally:
@@ -219,6 +222,9 @@ class OmniScanTitan:
                     break
                 host, port, proto = item
                 
+                if self.opsec:
+                    await asyncio.sleep(random.uniform(0.1, 0.5))
+                    
                 banner = None
                 if proto == "tcp": 
                     banner = await self._smart_banner_grab(host, port)
@@ -258,24 +264,19 @@ class OmniScanTitan:
 
     async def _feeder(self, queue: asyncio.Queue, progress: Progress, task_id: int) -> None:
         try:
-            resolved_ips = set()
+            total_items = 0
             for t in self.raw_targets:
                 async for ip in self._resolve_target(t): 
-                    resolved_ips.add(ip)
-
-            total_items = 0
-            for ip in resolved_ips:
-                for port in self.ports:
-                    if self.shutdown_event.is_set(): break
-                    await queue.put((ip, port, "tcp"))
-                    total_items += 1
-                if self.udp_enabled:
-                    for udp_port in UDP_PAYLOADS.keys():
+                    for port in self.ports:
                         if self.shutdown_event.is_set(): break
-                        await queue.put((ip, udp_port, "udp"))
+                        await queue.put((ip, port, "tcp"))
                         total_items += 1
-
-            progress.update(task_id, total=total_items)
+                    if self.udp_enabled:
+                        for udp_port in UDP_PAYLOADS.keys():
+                            if self.shutdown_event.is_set(): break
+                            await queue.put((ip, udp_port, "udp"))
+                            total_items += 1
+                    progress.update(task_id, total=total_items)
         finally:
             for _ in range(self.max_workers): 
                 await queue.put(_SENTINEL)
@@ -297,26 +298,33 @@ class OmniScanTitan:
         feeder_task = asyncio.create_task(self._feeder(queue, progress, task_id))
         workers = [asyncio.create_task(self._worker(queue, progress, task_id)) for _ in range(self.max_workers)]
 
-        with Live(refresh_per_second=10) as live:
-            while not feeder_task.done() or not queue.empty() or not all(w.done() for w in workers):
-                if self.shutdown_event.is_set():
-                    feeder_task.cancel()
-                    for w in workers: w.cancel()
-                    break
-                async with self.lock:
-                    content = "\n".join(self.live_discoveries) if self.live_discoveries else "[dim]Scanning digital footprint...[/dim]"
-                    stats = f"[green]Hosts:[/green] {len(self.stats['hosts_up'])} | [cyan]Ports:[/cyan] {self.stats['ports_open']} | [red]Vulns:[/red] {self.stats['vulns_found']}"
-                
-                layout = Layout()
-                layout.split_column(
-                    Layout(Panel(content, title="⚡ Live Telemetry", border_style="cyan"), ratio=3),
-                    Layout(Panel(stats, border_style="green"), ratio=1),
-                    Layout(progress, ratio=1)
-                )
-                live.update(layout)
-                await asyncio.sleep(0.1)
+        async def update_ui():
+            with Live(refresh_per_second=10) as live:
+                while not self.shutdown_event.is_set() and (not feeder_task.done() or not queue.empty() or not all(w.done() for w in workers)):
+                    async with self.lock:
+                        content = "\n".join(self.live_discoveries) if self.live_discoveries else "[dim]Scanning digital footprint...[/dim]"
+                        stats = f"[green]Hosts:[/green] {len(self.stats['hosts_up'])} | [cyan]Ports:[/cyan] {self.stats['ports_open']} | [red]Vulns:[/red] {self.stats['vulns_found']}"
+                    
+                    layout = Layout()
+                    layout.split_column(
+                        Layout(Panel(content, title="⚡ Live Telemetry", border_style="cyan"), ratio=3),
+                        Layout(Panel(stats, border_style="green"), ratio=1),
+                        Layout(progress, ratio=1)
+                    )
+                    live.update(layout)
+                    await asyncio.sleep(0.1)
+
+        ui_task = asyncio.create_task(update_ui())
+
+        while not feeder_task.done() or not queue.empty() or not all(w.done() for w in workers):
+            if self.shutdown_event.is_set():
+                feeder_task.cancel()
+                for w in workers: w.cancel()
+                break
+            await asyncio.sleep(0.1)
 
         await queue.join()
+        ui_task.cancel()
         
         if self.http_session:
             await self.http_session.close()
@@ -360,14 +368,18 @@ class OmniScanTitan:
         nmap_tasks = []
         if specific_targets:
             port_map = {}
+            nmap_tasks = []
+        if specific_targets:
+            port_map = {}
+            shm_dir = "/dev/shm" if os.path.isdir("/dev/shm") else None
             for host, ports in specific_targets.items():
                 if ports: 
                     port_map.setdefault(tuple(sorted(ports)), []).append(host)
             for tup_ports, hosts in port_map.items():
-                fd, path = tempfile.mkstemp(text=True)
+                fd, path = tempfile.mkstemp(text=True, dir=shm_dir)
                 with os.fdopen(fd, "w") as f: 
                     f.write("\n".join(hosts))
-                xml_fd, xml_path = tempfile.mkstemp(suffix=".xml", text=True)
+                xml_fd, xml_path = tempfile.mkstemp(suffix=".xml", text=True, dir=shm_dir)
                 os.close(xml_fd)
                 cmd = ["nmap"] + self.nmap_args + ["-p", ",".join(map(str, tup_ports[:200])), "-oX", xml_path, "-iL", path]
                 nmap_tasks.append((cmd, xml_path, path))
@@ -375,13 +387,15 @@ class OmniScanTitan:
         nmap_semaphore = asyncio.Semaphore(10)
         async def _run(cmd, xml_path, target_list):
             async with nmap_semaphore:
-                proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
-                await proc.communicate()
-                
-                loop = asyncio.get_running_loop()
-                updates = await loop.run_in_executor(self.process_pool, self._parse_nmap_xml, xml_path)
-                
-                if updates:
+                proc = None
+                try:
+                    proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+                    await proc.communicate()
+                    
+                    loop = asyncio.get_running_loop()
+                    updates = await loop.run_in_executor(self.process_pool, self._parse_nmap_xml, xml_path)
+                    
+                    if updates:
                     async with self.lock:
                         for addr, p_dict in updates.items():
                             if addr not in self.results: 
@@ -391,8 +405,15 @@ class OmniScanTitan:
                                 e_banner = existing.get("info", "")
                                 new_banner = f"{e_banner} ➕ Nmap: {nd['nmap_banner']}" if e_banner else nd['nmap_banner']
                                 self.results[addr][pid] = {"state": "open", "service": nd["service"], "info": new_banner, "vulns": existing.get("vulns", [])}
-                os.remove(xml_path)
-                os.remove(target_list)
+                finally:
+                    if proc and proc.returncode is None:
+                        try:
+                            proc.kill()
+                            await proc.wait()
+                        except ProcessLookupError:
+                            pass
+                    if os.path.exists(xml_path): os.remove(xml_path)
+                    if os.path.exists(target_list): os.remove(target_list)
 
         with Progress(SpinnerColumn("bouncingBall"), TextColumn("[red]Executing Nmap Tasks..."), TimeElapsedColumn()) as p:
             task = p.add_task("Nmap", total=len(nmap_tasks))
