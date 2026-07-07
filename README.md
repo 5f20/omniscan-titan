@@ -6,6 +6,7 @@
 [![Python 3.8+](https://img.shields.io/badge/Python-3.8%2B-blue.svg?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=for-the-badge)](https://opensource.org/licenses/MIT)
 [![Engine: Asynchronous](https://img.shields.io/badge/Engine-Asynchronous-success.svg?style=for-the-badge)](https://docs.python.org/3/library/asyncio.html)
+[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/144i)
 
 <br>
 
@@ -104,6 +105,12 @@ Titan supports comprehensive data exfiltration via non-blocking background threa
 * **$O(1)$ Telemetry Memory:** Live discovery feeds utilize fixed-length double-ended queues (`deque`), eliminating heavy $O(n)$ list shifting during rapid discovery events.
 * **Non-Blocking Disk I/O:** All JSON and CSV data dumping is securely offloaded to background execution threads, ensuring large network sweeps never freeze while writing to disk.
 * **Socket Hygiene:** Forces immediate termination of dirty TCP connections after partial banner grabs to keep the connection pool pristine.
+
+---
+
+## ☕ Support the Development
+
+If this tool has saved you time during a security engagement, helped secure your infrastructure, or you simply appreciate high-performance Python engineering, consider supporting the caffeine pipeline:
 
 ---
 
