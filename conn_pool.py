@@ -61,15 +61,22 @@ class ConnectionPool:
 
         # Establish a new connection if no valid recycled connections exist
         try:
+            untrusted = False
             if use_ssl:
-                ctx = ssl.create_default_context()
-                ctx.check_hostname = False
-                ctx.verify_mode = ssl.CERT_NONE
-                reader, writer = await asyncio.open_connection(host, port, ssl=ctx)
+                try:
+                    ctx = ssl.create_default_context()
+                    reader, writer = await asyncio.open_connection(host, port, ssl=ctx)
+                except ssl.SSLError:
+                    ctx = ssl.create_default_context()
+                    ctx.check_hostname = False
+                    ctx.verify_mode = ssl.CERT_NONE
+                    reader, writer = await asyncio.open_connection(host, port, ssl=ctx)
+                    untrusted = True
             else:
                 reader, writer = await asyncio.open_connection(host, port)
             
             conn = PooledConnection(reader, writer, time.monotonic())
+            conn.untrusted_ssl = untrusted
             conn.in_use = True
             return conn
         except Exception:
