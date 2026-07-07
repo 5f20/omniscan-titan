@@ -394,17 +394,18 @@ class OmniScanTitan:
                     
                     loop = asyncio.get_running_loop()
                     updates = await loop.run_in_executor(self.process_pool, self._parse_nmap_xml, xml_path)
-                    
-                    if updates:
-                    async with self.lock:
-                        for addr, p_dict in updates.items():
-                            if addr not in self.results: 
-                                self.results[addr] = {}
-                            for pid, nd in p_dict.items():
-                                existing = self.results[addr].get(pid, {})
-                                e_banner = existing.get("info", "")
-                                new_banner = f"{e_banner} ➕ Nmap: {nd['nmap_banner']}" if e_banner else nd['nmap_banner']
-                                self.results[addr][pid] = {"state": "open", "service": nd["service"], "info": new_banner, "vulns": existing.get("vulns", [])}
+                    # Remove the duplicate block and fix indentation inside _run()
+        if updates:
+            async with self.lock:
+                for addr, p_dict in updates.items():
+                    if addr not in self.results: 
+                        self.results[addr] = {}
+                    for pid, nd in p_dict.items():
+                        existing = self.results[addr].get(pid, {})
+                        e_banner = existing.get("info", "")
+                        new_banner = f"{e_banner} ➕ Nmap: {nd['nmap_banner']}" if e_banner else nd['nmap_banner']
+                        self.results[addr][pid] = {"state": "open", "service": nd["service"], "info": new_banner, "vulns": existing.get("vulns", [])}
+                        
                 finally:
                     if proc and proc.returncode is None:
                         try:
