@@ -31,7 +31,7 @@ def setup_signal_handlers(scanner):
 
 async def main_async() -> None:
     parser = argparse.ArgumentParser(description="OmniScan Titan ⚡ Network Intelligence Framework")
-    parser.add_argument("-t", "--target", help="Target IP/CIDR", required=True)
+    parser.add_argument("-t", "--target", help="Target IP/CIDR") # required=True removed
     parser.add_argument("-iL", "--input-file", help="File of targets")
     parser.add_argument("-p", "--ports", default="top", help="Ports (e.g. 80,443 or top)")
     parser.add_argument("-m", "--mode", choices=["async", "hybrid"], default="hybrid")
