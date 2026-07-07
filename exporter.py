@@ -54,13 +54,8 @@ async def export_sqlite(path: str, items: Iterable[Dict[str, Any]]):
                (timestamp TEXT, host TEXT, port INTEGER, state TEXT, service TEXT, info TEXT, vulns TEXT)"""
         )
         now = datetime.now().isoformat()
-        async with db.execute("BEGIN"):
-            for it in items:
-                await db.execute(
-                    "INSERT INTO scans VALUES (?,?,?,?,?,?,?)",
-                    (now, it.get("host"), it.get("port"), it.get("state"),
-                     it.get("service"), it.get("info"), ", ".join(it.get("vulns", [])))
-                )
+        rows = [(now, it.get("host"), it.get("port"), it.get("state"), it.get("service"), it.get("info"), ", ".join(it.get("vulns", []))) for it in items]
+        await db.executemany("INSERT INTO scans VALUES (?,?,?,?,?,?,?)", rows)
         await db.commit()
     console.print(f"[+] Exported SQLite DB   -> [bold green]{path}[/bold green]")
 
