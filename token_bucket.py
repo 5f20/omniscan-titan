@@ -15,18 +15,18 @@ class TokenBucket:
         self._lock = asyncio.Lock()
 
     async def consume(self, tokens: int = 1, timeout: Optional[float] = None) -> bool:
-        """
-        Attempts to consume a specific number of tokens.
-        Blocks asynchronously until tokens are available or the timeout is reached.
-        """
+        if tokens > self._capacity:
+            return False # Prevents infinite loop trap
+            
         deadline = None if timeout is None else time.monotonic() + timeout
-        async with self._lock:
-            while True:
+        
+        while True:
+            async with self._lock:
                 now = time.monotonic()
                 elapsed = now - self._last
                 
                 if elapsed > 0:
-                    self._tokens = min(self._capacity, self._tokens + elapsed * self._rate)
+                    self._tokens = min(float(self._capacity), self._tokens + elapsed * self._rate)
                     self._last = now
                     
                 if self._tokens >= tokens:
@@ -38,4 +38,6 @@ class TokenBucket:
                     
                 need = tokens - self._tokens
                 sleep_time = max(need / self._rate, 0.001)
-                await asyncio.sleep(min(sleep_time, 1.0))
+                
+            # ✅ SLEEP MUST BE OUTSIDE THE LOCK
+            await asyncio.sleep(min(sleep_time, 1.0))
