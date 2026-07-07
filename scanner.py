@@ -53,7 +53,9 @@ class OmniScanTitan:
         self.process_pool = concurrent.futures.ProcessPoolExecutor(max_workers=cpu_cores)
 
         self.results: Dict[str, Dict[int, Dict[str, Any]]] = {}
-        self.live_discoveries: List[str] = []
+        from collections import deque
+        # Inside __init__
+        self.live_discoveries = deque(maxlen=8)
         self.stats: Dict[str, Any] = {"hosts_up": set(), "ports_open": 0, "vulns_found": 0}
 
         self.lock = asyncio.Lock()
@@ -210,7 +212,7 @@ class OmniScanTitan:
             pass
         finally:
             if conn: 
-                await self.pool.release(host, port, use_ssl, conn, keep_alive=True)
+                await self.pool.release(host, port, use_ssl, conn, keep_alive=False)
                 
         return srv_name
 
@@ -375,12 +377,16 @@ class OmniScanTitan:
             for host, ports in specific_targets.items():
                 if ports: 
                     port_map.setdefault(tuple(sorted(ports)), []).append(host)
-            for tup_ports, hosts in port_map.items():
+            from utils import _TEMP_FILES_REGISTRY
+                
                 fd, path = tempfile.mkstemp(text=True, dir=shm_dir)
                 with os.fdopen(fd, "w") as f: 
                     f.write("\n".join(hosts))
                 xml_fd, xml_path = tempfile.mkstemp(suffix=".xml", text=True, dir=shm_dir)
                 os.close(xml_fd)
+                
+                # Add to registry immediately
+                _TEMP_FILES_REGISTRY.extend([path, xml_path])
                 cmd = ["nmap"] + self.nmap_args + ["-p", ",".join(map(str, tup_ports[:200])), "-oX", xml_path, "-iL", path]
                 nmap_tasks.append((cmd, xml_path, path))
 
